@@ -11,17 +11,40 @@ It validates the **analysis logic itself**.
 
 ## Quick Start
 
+### Using uv (Recommended)
+
+1. Install dependencies and run FastSSV:
+  ```bash
+  uv run python main.py path/to/query.sql
+  ```
+
+2. Or set up a development environment:
+  ```bash
+  uv sync
+  source .venv/bin/activate
+  python main.py path/to/query.sql
+  ```
+
+3. Run the validation unit tests:
+  ```bash
+  uv run python -m unittest
+  ```
+
+### Using pip
+
 1. Create and activate a virtual environment, then install FastSSV in editable mode:
   ```bash
   python -m venv .venv && source .venv/bin/activate
   pip install -e .
   ```
+
 2. Validate a SQL file (or pipe SQL via stdin):
   ```bash
   python main.py path/to/query.sql
   # or
   cat query.sql | python main.py --dialect duckdb
   ```
+
 3. Run the validation unit tests:
   ```bash
   python -m unittest
