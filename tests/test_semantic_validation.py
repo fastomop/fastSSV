@@ -245,8 +245,8 @@ class EdgeCasesTests(unittest.TestCase):
 class InvalidReasonEnforcementTests(unittest.TestCase):
     """Tests for invalid_reason enforcement rule."""
 
-    def _validate_invalid_reason(self, sql: str) -> list[str]:
-        """Run only the invalid_reason enforcement rule."""
+    def _run_invalid_reason_rule(self, sql: str) -> list[str]:
+        """Run invalid_reason enforcement rule and return formatted violations."""
         from fastssv.core.base import Severity
         from fastssv.core.registry import get_rule
 
@@ -270,7 +270,7 @@ class InvalidReasonEnforcementTests(unittest.TestCase):
         FROM concept
         WHERE domain_id = 'Drug'
         """
-        errors = self._validate_invalid_reason(sql)
+        errors = self._run_invalid_reason_rule(sql)
         self.assertTrue(len(errors) > 0)
         self.assertTrue(any("concept" in e and "invalid_reason" in e for e in errors))
         # Should be ERROR, not warning
@@ -284,7 +284,7 @@ class InvalidReasonEnforcementTests(unittest.TestCase):
         WHERE domain_id = 'Drug'
         AND invalid_reason IS NULL
         """
-        errors = self._validate_invalid_reason(sql)
+        errors = self._run_invalid_reason_rule(sql)
         self.assertEqual(errors, [])
 
     def test_concept_table_with_invalid_reason_is_not_null(self) -> None:
@@ -294,7 +294,7 @@ class InvalidReasonEnforcementTests(unittest.TestCase):
         FROM concept
         WHERE invalid_reason IS NOT NULL
         """
-        errors = self._validate_invalid_reason(sql)
+        errors = self._run_invalid_reason_rule(sql)
         self.assertEqual(errors, [])
 
     def test_concept_relationship_without_invalid_reason(self) -> None:
@@ -304,7 +304,7 @@ class InvalidReasonEnforcementTests(unittest.TestCase):
         FROM concept_relationship
         WHERE relationship_id = 'Maps to'
         """
-        errors = self._validate_invalid_reason(sql)
+        errors = self._run_invalid_reason_rule(sql)
         self.assertTrue(len(errors) > 0)
         self.assertTrue(any("concept_relationship" in e for e in errors))
 
@@ -316,7 +316,7 @@ class InvalidReasonEnforcementTests(unittest.TestCase):
         WHERE relationship_id = 'Maps to'
         AND invalid_reason IS NULL
         """
-        errors = self._validate_invalid_reason(sql)
+        errors = self._run_invalid_reason_rule(sql)
         self.assertEqual(errors, [])
 
     # Tests for derived tables WITHOUT invalid_reason column (WARNING)
@@ -328,7 +328,7 @@ class InvalidReasonEnforcementTests(unittest.TestCase):
         FROM concept_ancestor
         WHERE ancestor_concept_id = 201826
         """
-        errors = self._validate_invalid_reason(sql)
+        errors = self._run_invalid_reason_rule(sql)
         self.assertTrue(len(errors) > 0)
         self.assertTrue(any("concept_ancestor" in e for e in errors))
         # Should be WARNING, not error
@@ -343,7 +343,7 @@ class InvalidReasonEnforcementTests(unittest.TestCase):
         WHERE ca.ancestor_concept_id = 201826
         AND c.invalid_reason IS NULL
         """
-        errors = self._validate_invalid_reason(sql)
+        errors = self._run_invalid_reason_rule(sql)
         self.assertEqual(errors, [])
 
     def test_concept_synonym_without_concept_join(self) -> None:
@@ -353,7 +353,7 @@ class InvalidReasonEnforcementTests(unittest.TestCase):
         FROM concept_synonym
         WHERE concept_synonym_name LIKE '%diabetes%'
         """
-        errors = self._validate_invalid_reason(sql)
+        errors = self._run_invalid_reason_rule(sql)
         self.assertTrue(len(errors) > 0)
         self.assertTrue(any("concept_synonym" in e for e in errors))
         self.assertTrue(any(e.startswith("Warning:") for e in errors))
@@ -364,7 +364,7 @@ class InvalidReasonEnforcementTests(unittest.TestCase):
         SELECT drug_concept_id, ingredient_concept_id
         FROM drug_strength
         """
-        errors = self._validate_invalid_reason(sql)
+        errors = self._run_invalid_reason_rule(sql)
         self.assertTrue(len(errors) > 0)
         self.assertTrue(any("drug_strength" in e for e in errors))
 
@@ -377,7 +377,7 @@ class InvalidReasonEnforcementTests(unittest.TestCase):
         FROM condition_occurrence
         WHERE condition_concept_id = 201826
         """
-        errors = self._validate_invalid_reason(sql)
+        errors = self._run_invalid_reason_rule(sql)
         self.assertEqual(errors, [])
 
     def test_multiple_clinical_tables_no_check(self) -> None:
@@ -387,7 +387,7 @@ class InvalidReasonEnforcementTests(unittest.TestCase):
         FROM condition_occurrence co
         JOIN drug_exposure de ON co.person_id = de.person_id
         """
-        errors = self._validate_invalid_reason(sql)
+        errors = self._run_invalid_reason_rule(sql)
         self.assertEqual(errors, [])
 
     # Edge cases
@@ -401,7 +401,7 @@ class InvalidReasonEnforcementTests(unittest.TestCase):
             ON co.condition_concept_id = c.concept_id
             AND c.invalid_reason IS NULL
         """
-        errors = self._validate_invalid_reason(sql)
+        errors = self._run_invalid_reason_rule(sql)
         self.assertEqual(errors, [])
 
     def test_mixed_vocabulary_and_clinical_tables(self) -> None:
@@ -412,7 +412,7 @@ class InvalidReasonEnforcementTests(unittest.TestCase):
         JOIN concept c ON co.condition_concept_id = c.concept_id
         WHERE c.standard_concept = 'S'
         """
-        errors = self._validate_invalid_reason(sql)
+        errors = self._run_invalid_reason_rule(sql)
         # Should still flag missing invalid_reason on concept table
         self.assertTrue(len(errors) > 0)
         self.assertTrue(any("concept" in e for e in errors))
@@ -426,7 +426,7 @@ class InvalidReasonEnforcementTests(unittest.TestCase):
             WHERE vocabulary_id = 'SNOMED'
         )
         """
-        errors = self._validate_invalid_reason(sql)
+        errors = self._run_invalid_reason_rule(sql)
         # Should flag the concept table in the subquery
         self.assertTrue(len(errors) > 0)
 
@@ -440,7 +440,7 @@ class InvalidReasonEnforcementTests(unittest.TestCase):
         )
         SELECT * FROM descendants
         """
-        errors = self._validate_invalid_reason(sql)
+        errors = self._run_invalid_reason_rule(sql)
         # Should warn about concept_ancestor
         self.assertTrue(len(errors) > 0)
         self.assertTrue(any("concept_ancestor" in e for e in errors))
@@ -452,7 +452,7 @@ class InvalidReasonEnforcementTests(unittest.TestCase):
         FROM condition_occurrence
         WHERE condition_start_date > '2020-01-01'
         """
-        errors = self._validate_invalid_reason(sql)
+        errors = self._run_invalid_reason_rule(sql)
         self.assertEqual(errors, [])
 
 

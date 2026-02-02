@@ -121,19 +121,19 @@ def _get_vocabulary_tables_used(tree: exp.Expression) -> Tuple[Set[str], Set[str
     return tables_with_invalid_reason, derived_tables
 
 
-def _uses_concept_with_invalid_reason_filter(tree: exp.Expression) -> bool:
-    """Check if query JOINs to concept table and filters by invalid_reason.
+def _has_concept_join_with_invalid_reason_filter(tree: exp.Expression) -> bool:
+    """Check if query has both a concept table join AND an invalid_reason filter.
 
     This is used to check if derived tables (like concept_ancestor) properly
-    filter concepts by joining to the concept table.
+    filter concepts by joining to the concept table and filtering by invalid_reason.
 
     Args:
         tree: The SQL AST to search
 
     Returns:
-        True if there's a JOIN to concept with invalid_reason IS NULL
+        True if both concept table is joined AND invalid_reason filter is present
     """
-    # Check if concept table is used
+    # Check if concept table is used (joined)
     if not uses_table(tree, "concept"):
         return False
 
@@ -201,9 +201,9 @@ class InvalidReasonEnforcementRule(Rule):
             # Handle derived tables (concept_ancestor, etc.)
             if derived_tables:
                 # Check if they JOIN to concept with invalid_reason filter
-                has_concept_filter = _uses_concept_with_invalid_reason_filter(tree)
+                has_concept_join_with_invalid_reason_filter = _has_concept_join_with_invalid_reason_filter(tree)
 
-                if not has_concept_filter:
+                if not has_concept_join_with_invalid_reason_filter:
                     tables_str = ", ".join(sorted(derived_tables))
 
                     message = (
