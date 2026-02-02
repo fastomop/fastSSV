@@ -214,7 +214,7 @@ class InvalidReasonEnforcementRule(Rule):
 
                     violations.append(self.create_violation(
                         message=message,
-                        severity=Severity.WARNING,  # Warning, not error, since the column doesn't exist
+                        severity=Severity.WARNING,  # Warning, not error, since the column does not exist
                         suggested_fix=(
                             "JOIN to concept table and add: WHERE concept.invalid_reason IS NULL"
                         ),
