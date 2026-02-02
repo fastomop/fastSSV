@@ -16,7 +16,6 @@ from sqlglot import exp
 
 from fastssv.core.base import Rule, RuleViolation, Severity
 from fastssv.core.helpers import (
-    extract_aliases,
     is_in_where_or_join_clause,
     normalize_name,
     parse_sql,
@@ -38,25 +37,6 @@ DERIVED_VOCABULARY_TABLES = {
     "concept_synonym",
     "drug_strength",
     "source_to_concept_map",
-}
-
-# Clinical event tables where invalid_reason filtering should NOT be enforced
-CLINICAL_TABLES = {
-    "condition_occurrence",
-    "drug_exposure",
-    "procedure_occurrence",
-    "measurement",
-    "observation",
-    "device_exposure",
-    "visit_occurrence",
-    "visit_detail",
-    "death",
-    "specimen",
-    "episode",
-    "note",
-    "note_nlp",
-    "payer_plan_period",
-    "cost",
 }
 
 
