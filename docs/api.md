@@ -202,7 +202,7 @@ Liveness probe. Always `200 OK` unless the process cannot service requests.
 ```json
 {
   "status": "ok",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "rules_loaded": 155
 }
 ```
