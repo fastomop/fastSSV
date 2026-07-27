@@ -91,10 +91,10 @@ def _has_cost_domain_id_filter(tree: exp.Expression, aliases: dict) -> bool:
             if isinstance(right, exp.Literal) and right.is_string:
                 return True
         else:  # exp.In
-            if any(
-                isinstance(unwrap_cast(v), exp.Literal) and unwrap_cast(v).is_string for v in (node.expressions or [])
-            ):
-                return True
+            for v in node.expressions or []:
+                inner = unwrap_cast(v)
+                if isinstance(inner, exp.Literal) and inner.is_string:
+                    return True
     return False
 
 

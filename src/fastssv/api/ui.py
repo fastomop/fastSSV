@@ -23,7 +23,7 @@ from fastapi.templating import Jinja2Templates
 from slowapi.util import get_remote_address
 
 from fastssv import validate_sql_structured
-from fastssv.api._validation import _NULL_CONTEXT
+from fastssv.api._validation import ValidationCapacityError, run_bounded
 from fastssv.api.config import Settings
 from fastssv.core.base import Severity
 from fastssv.core.helpers import split_sql_statements
@@ -199,8 +199,19 @@ async def ui_validate(
 
     # Same per-worker concurrency bound as /v1/validate: a timed-out parse
     # keeps its thread busy, so refuse new work instead of pinning the pool.
-    semaphore = getattr(request.app.state, "validation_semaphore", None)
-    if semaphore is not None and semaphore.locked():
+    # run_bounded holds the permit until the worker thread finishes.
+    limiter = getattr(request.app.state, "validation_limiter", None)
+
+    started = time.perf_counter()
+    try:
+        per_query = await run_bounded(
+            _validate_each,
+            statements,
+            dialect,
+            limiter=limiter,
+            timeout=settings.parse_timeout_seconds,
+        )
+    except ValidationCapacityError:
         logger.warning(
             "ui_validation_capacity_exceeded",
             extra={"sql_hash": _sql_hash(sql), "client": get_remote_address(request), "request_id": request_id},
@@ -211,14 +222,6 @@ async def ui_validate(
             detail="Validation capacity is exhausted; retry in a moment.",
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         )
-
-    started = time.perf_counter()
-    try:
-        async with semaphore if semaphore is not None else _NULL_CONTEXT:
-            per_query = await asyncio.wait_for(
-                asyncio.to_thread(_validate_each, statements, dialect),
-                timeout=settings.parse_timeout_seconds,
-            )
     except asyncio.TimeoutError:
         logger.warning(
             "ui_validation_timeout",

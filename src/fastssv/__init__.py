@@ -455,6 +455,7 @@ __all__ = [
     "validate_sql_structured",
     "PARSE_ERROR_RULE_ID",
     "NOT_SQL_RULE_ID",
+    "TEMPLATE_RULE_ID",
     "RULE_EXECUTION_ERROR_RULE_ID",
     # Core classes
     "Rule",

@@ -42,7 +42,7 @@ async def validate(req: ValidationRequest, request: Request) -> ValidationRespon
         settings,
         client=get_remote_address(request),
         request_id=getattr(request.state, "request_id", None),
-        semaphore=getattr(request.app.state, "validation_semaphore", None),
+        limiter=getattr(request.app.state, "validation_limiter", None),
     )
 
 

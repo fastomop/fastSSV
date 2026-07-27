@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import uuid
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -20,6 +19,7 @@ from slowapi.util import get_remote_address
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.types import ASGIApp
 
+from fastssv.api._validation import ValidationLimiter
 from fastssv.api.config import Settings, get_settings
 from fastssv.api.models import ErrorResponse
 from fastssv.api.routes import router
@@ -270,7 +270,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.mcp_mounted = mcp_app is not None
     # Bounds concurrent validation work per worker process; run_validation
     # fails fast with 503 when saturated (see Settings.max_concurrent_validations).
-    app.state.validation_semaphore = asyncio.Semaphore(settings.max_concurrent_validations)
+    # Permits are tied to worker-thread lifetime, not request lifetime — a
+    # timed-out request's parse still occupies its permit until it finishes.
+    app.state.validation_limiter = ValidationLimiter(settings.max_concurrent_validations)
 
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 

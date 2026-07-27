@@ -185,14 +185,11 @@ def test_security_headers_present(client: TestClient):
 
 
 def test_validation_capacity_returns_503(client: TestClient):
-    """With the per-worker semaphore saturated, /v1/validate fails fast with
+    """With the per-worker limiter saturated, /v1/validate fails fast with
     503 instead of queueing onto (potentially pinned) worker threads."""
-    import asyncio
-
-    sem = client.app.state.validation_semaphore
+    limiter = client.app.state.validation_limiter
     held = 0
-    while not sem.locked():
-        asyncio.run(sem.acquire())
+    while limiter.try_acquire():
         held += 1
     try:
         resp = client.post(
@@ -204,7 +201,7 @@ def test_validation_capacity_returns_503(client: TestClient):
         assert resp.headers["Retry-After"] == "1"
     finally:
         for _ in range(held):
-            sem.release()
+            limiter.release()
 
     # Released → requests flow again.
     resp = client.post(
@@ -212,6 +209,59 @@ def test_validation_capacity_returns_503(client: TestClient):
         json={"sql": "SELECT person_id FROM person;", "dialect": "postgres"},
     )
     assert resp.status_code == 200
+
+
+def test_timeout_does_not_free_capacity_while_thread_runs(monkeypatch):
+    """A 408 must NOT release the limiter permit: the abandoned parse still
+    occupies its worker thread, so capacity frees only when the thread ends.
+    Guards against the `async with semaphore` regression where wait_for's
+    timeout exit released the permit while the thread kept running."""
+    import threading
+    import time as _time
+
+    settings = Settings(
+        max_sql_bytes=4096,
+        parse_timeout_seconds=0.05,
+        rate_limit="1000/minute",
+        cors_origins=[],
+        log_level="WARNING",
+        mcp_enabled=False,
+        max_concurrent_validations=1,
+    )
+    app = create_app(settings)
+    finish_worker = threading.Event()
+
+    def fake_validate_each(statements, dialect):
+        finish_worker.wait(timeout=10)
+        return []
+
+    monkeypatch.setattr("fastssv.api._validation._validate_each", fake_validate_each)
+
+    payload = {"sql": "SELECT person_id FROM person;", "dialect": "postgres"}
+    # Context-managed client keeps one event loop alive across requests so
+    # the worker future's done callback (which releases the permit) runs.
+    with TestClient(app) as client:
+        limiter = app.state.validation_limiter
+
+        resp = client.post("/v1/validate", json=payload)
+        assert resp.status_code == 408
+        # Client got 408, but the worker thread is still parked → the
+        # permit must still be held...
+        assert limiter.active == 1
+        # ...so the next request is refused rather than starting a second
+        # thread the pool can't afford.
+        resp = client.post("/v1/validate", json=payload)
+        assert resp.status_code == 503
+
+        # Let the worker finish; the done callback releases the permit.
+        finish_worker.set()
+        deadline = _time.time() + 5
+        while limiter.active and _time.time() < deadline:
+            _time.sleep(0.01)
+            client.get("/v1/health")
+        assert limiter.active == 0
+
+        assert client.post("/v1/validate", json=payload).status_code == 200
 
 
 def test_health_exempt_from_rate_limit():
@@ -251,3 +301,19 @@ def test_error_response_includes_request_id(client: TestClient):
     body = resp.json()
     assert body["error"] == "payload_too_large"
     assert "request_id" in body
+
+
+def test_auto_dialect_resolves_cross_statement_scope(client: TestClient):
+    """dialect="auto" (the API default) must not break cross-statement
+    local-table scoping: the collectors can't parse with a pseudo-dialect,
+    so "auto" is resolved via detect_dialect before they run."""
+    sql = "CREATE TABLE tempresults AS SELECT person_id FROM person; SELECT person_id FROM tempresults;"
+    resp = client.post("/v1/validate", json={"sql": sql})  # dialect defaults to "auto"
+    assert resp.status_code == 200
+    body = resp.json()
+    # The scratch table created in statement 1 is in scope for statement 2.
+    assert not any(
+        v["rule_id"] == "data_quality.schema_validation" and "tempresults" in v["issue"] for v in body["errors"]
+    ), body["errors"]
+    # The response reports the dialect actually used, not the "auto" sentinel.
+    assert body["dialect"] != "auto"

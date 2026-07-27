@@ -5411,6 +5411,17 @@ class TestCostEventIdPolymorphicResolution:
         """
         assert self._run_rule(sql) == []
 
+    def test_join_with_non_string_in_list_still_fires(self) -> None:
+        """An IN list with no string literal is NOT a domain filter —
+        ``cost_domain_id IN (1, 2)`` must not silence the rule."""
+        sql = """
+        SELECT c.cost_id FROM cost c
+        JOIN drug_exposure de ON c.cost_event_id = de.drug_exposure_id
+        WHERE c.cost_domain_id IN (1, 2)
+        """
+        violations = self._run_rule(sql)
+        assert len(violations) == 1
+
     def test_no_cost_table_passes(self) -> None:
         assert self._run_rule("SELECT * FROM drug_exposure WHERE drug_concept_id = 1") == []
 

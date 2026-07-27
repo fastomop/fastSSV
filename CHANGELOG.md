@@ -31,7 +31,11 @@ between minor versions.
     its thread (CPU-bound sqlglot parses can't be cancelled), so under a
     burst of adversarial slow-parse submissions the pool used to stay
     pinned even after clients got 408s; the API and UI now fail fast with
-    503 + `Retry-After` when saturated instead.
+    503 + `Retry-After` when saturated instead. Permits are tied to the
+    *worker thread's* lifetime, not the request's: a 408 does not free
+    capacity while its abandoned parse is still burning a thread, and
+    acquisition is an atomic check on the event loop (no
+    check-then-acquire race).
   - `FASTSSV_API_RATE_LIMIT_STORAGE_URI` (default empty = in-memory):
     slowapi storage backend. The in-memory default is per-process — with N
     gunicorn workers the effective limit is N × `FASTSSV_API_RATE_LIMIT`
@@ -134,7 +138,10 @@ between minor versions.
   call a new `fastssv.core.helpers.looks_like_unrendered_template`
   detector *before* parsing, and when it matches return a single
   structured violation with `rule_id="meta.unrendered_sqlrender_template"`,
-  `severity=WARNING`, and a "run SqlRender first" suggested fix.
+  `severity=WARNING`, and a "run SqlRender first" suggested fix. The id
+  is exported as `fastssv.TEMPLATE_RULE_ID` (in `__all__`, alongside
+  `PARSE_ERROR_RULE_ID` / `NOT_SQL_RULE_ID`) so consumers can filter on
+  it without hard-coding the string.
   Detection deliberately targets `@<word>` only in
   syntactically-impossible TSQL positions: embedded inside an
   identifier (`tmpach_@domainId_cost_raw`), as a qualifier before a
@@ -410,6 +417,19 @@ between minor versions.
   (`ANALYZE tempResults_104`, `ANALYZE scratch.tmpach_0`).
 
 ### Fixed
+
+- **`dialect="auto"` (the API/MCP default) no longer silently disables
+  cross-statement local-table scoping.** `run_validation` passed the raw
+  `"auto"` sentinel to `collect_locally_defined_tables` /
+  `collect_locally_defined_unqualified_tables`, which can't parse with a
+  pseudo-dialect and fail open to an empty set — so scratch tables
+  created earlier in a batch were flagged as unknown OMOP tables whenever
+  the caller relied on the default dialect. `"auto"` is now resolved via
+  `detect_dialect` once on the whole submission (mirroring the CLI)
+  before the collectors run; as a side effect every statement is
+  validated under one consistently detected dialect (previously each
+  statement re-detected independently) and the API response's `dialect`
+  field reports the dialect actually used instead of echoing `"auto"`.
 
 - **The JSON log formatter now serializes every field passed via
   `extra=`.** `JSONFormatter` previously emitted only a fixed allowlist
