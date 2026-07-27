@@ -138,3 +138,22 @@ def test_build_validation_result_shape() -> None:
     assert result["error_count"] == 1
     assert result["warning_count"] == 1
     assert "errors" in result and "warnings" in result
+
+
+def test_main_missing_file_exits_2_without_traceback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    monkeypatch.chdir(tmp_path)
+    rc = main([str(tmp_path / "does_not_exist.sql"), "--log-level", "CRITICAL"])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "cannot read SQL from" in err
+
+
+def test_main_rejects_phantom_categories(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    """`analytics`/`performance`/`schema` used to be accepted but matched zero
+    rules, silently reporting VALID. argparse must now reject them outright."""
+    sql_file = tmp_path / "q.sql"
+    sql_file.write_text("SELECT person_id FROM person;")
+    for phantom in ("analytics", "performance", "schema"):
+        with pytest.raises(SystemExit) as excinfo:
+            main([str(sql_file), "--categories", phantom])
+        assert excinfo.value.code == 2

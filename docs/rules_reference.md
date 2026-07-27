@@ -2,9 +2,9 @@
 
 This document provides comprehensive documentation for FastSSV's validation rules.
 
-**Current registry: 154 rules across 6 categories.**
+**Current registry: 155 rules across 6 categories.**
 
-- **anti_patterns**: 20 rules
+- **anti_patterns**: 21 rules
 - **concept_standardization**: 18 rules
 - **data_quality**: 22 rules
 - **domain_specific**: 48 rules
@@ -148,6 +148,7 @@ For each rule you will find:
 | `anti_patterns.concept_code_requires_vocabulary_id` | [Concept Code Requires Vocabulary ID](#anti-patterns-concept-code-requires-vocabulary-id) | WARNING | anti_patterns |
 | `anti_patterns.concept_name_lookup` | [Concept Name Lookup Anti-pattern](#anti-patterns-concept-name-lookup) | WARNING | anti_patterns |
 | `anti_patterns.concept_relationship_transitive_misuse` | [Concept Relationship Transitive Misuse](#anti-patterns-concept-relationship-transitive-misuse) | WARNING | anti_patterns |
+| `anti_patterns.cte_shadows_omop_table`{ #anti-patterns-cte-shadows-omop-table } | [CTE or Subquery Alias Shadows OMOP CDM Table](#anti-patterns-cte-shadows-omop-table) | WARNING | anti_patterns |
 | `anti_patterns.destructive_operations_on_clinical_tables` | [Destructive Operations on Clinical Tables](#anti-patterns-destructive-operations-on-clinical-tables) | ERROR | anti_patterns |
 | `anti_patterns.duplicate_column_alias`{ #anti-patterns-duplicate-column-alias } | [Duplicate Column Alias](#anti-patterns-duplicate-column-alias) | WARNING | anti_patterns |
 | `anti_patterns.having_without_group_by` | [Having Without Group By](#anti-patterns-having-without-group-by) | ERROR | anti_patterns |
@@ -202,7 +203,7 @@ For each rule you will find:
 | `domain_specific.visit_detail_admitted_discharged_domain` | [Visit Detail Admitted/Discharged Domain Validation](#domain-specific-visit-detail-admitted-discharged-domain) | WARNING | domain_specific |
 | `domain_specific.visit_detail_dates_within_parent_visit` | [Visit Detail Dates Within Parent Visit](#domain-specific-visit-detail-dates-within-parent-visit) | WARNING | domain_specific |
 | `domain_specific.visit_detail_has_no_preceding_visit_occurrence_id` | [Visit Detail Has No Preceding Visit Occurrence ID](#domain-specific-visit-detail-has-no-preceding-visit-occurrence-id) | ERROR | domain_specific |
-| `domain_specific.visit_detail_visit_occurrence_reference` | [Visit Detail Visit Occurrence Reference](#domain-specific-visit-detail-visit-occurrence-reference) | ERROR | domain_specific |
+| `domain_specific.visit_detail_visit_occurrence_reference` | [Visit Detail Visit Occurrence Linkage](#domain-specific-visit-detail-visit-occurrence-reference) | ERROR | domain_specific |
 | `domain_specific.visit_event_temporal_validation` | [Visit Event Temporal Validation](#domain-specific-visit-event-temporal-validation) | WARNING | domain_specific |
 | `domain_specific.visit_length_of_stay_arithmetic`{ #domain-specific-visit-length-of-stay-arithmetic } | [Visit Length-of-Stay Arithmetic](#domain-specific-visit-length-of-stay-arithmetic) | WARNING | domain_specific |
 | `domain_specific.visit_occurrence_type_domain`{ #domain-specific-visit-occurrence-type-domain } | [Visit Occurrence Type Concept Domain Validation](#domain-specific-visit-occurrence-type-domain) | ERROR | domain_specific |
@@ -6909,57 +6910,71 @@ Use preceding_visit_detail_id for visit_detail temporal chain. Use preceding_vis
 
 ---
 
-### 4. Visit Detail Visit Occurrence Reference { #domain-specific-visit-detail-visit-occurrence-reference }
+### 4. Visit Detail Visit Occurrence Linkage { #domain-specific-visit-detail-visit-occurrence-reference }
 
 **Rule ID:** `domain_specific.visit_detail_visit_occurrence_reference`
-**Severity:** WARNING
+**Severity:** ERROR
 
 #### Intent
 
-visit_detail provides granular sub-visit information (ICU stay, ward transfer,
-    operating room), but critical context is stored in visit_occurrence:
-    - Overall visit type (inpatient, outpatient, ER)
-    - Visit-level dates (visit_start_date, visit_end_date)
-    - Visit-level provider and care site
-    - Admission source and discharge destination
+When a query references *both* `visit_detail` and `visit_occurrence`, the
+relational link must be on
+`visit_detail.visit_occurrence_id = visit_occurrence.visit_occurrence_id`.
+Linking on any other key (e.g. `person_id` alone) silently fans rows out
+within a person and produces wrong analytics.
 
-    Analyzing visit_detail without referencing visit_occurrence loses this context.
+The rule does NOT fire when `visit_detail` is used alone. Detail-only
+analyses — counting distinct `visit_detail_concept_id` per person,
+distributing length-of-stay by detail concept, etc. — are legitimate;
+`visit_detail` carries its own `person_id`, dates, and concept columns.
+Column-on-wrong-table mistakes such as `vd.visit_concept_id` are caught
+by `data_quality.schema_validation` instead.
 
 #### How it works
 
-This rule analyzes the SQL query to identify visit detail visit occurrence reference patterns.
+Only triggers when both `visit_detail` and `visit_occurrence` are
+referenced. Scans `JOIN ... ON`, `WHERE`, and subquery scopes for an
+equality between `visit_detail.visit_occurrence_id` and
+`visit_occurrence.visit_occurrence_id`. Reports an error if none is
+found.
 
 #### Examples
 
 **Violation patterns:**
 
 ```sql
-SELECT person_id, visit_detail_start_date
-    FROM visit_detail
-    WHERE visit_detail_concept_id = 32037  -- ICU
+SELECT vd.*, vo.*
+FROM visit_detail vd
+JOIN visit_occurrence vo ON vd.person_id = vo.person_id  -- WRONG key
+```
+
+```sql
+SELECT vd.visit_detail_id, vo.visit_occurrence_id
+FROM visit_detail vd, visit_occurrence vo            -- no linking predicate
 ```
 
 **Correct patterns:**
 
 ```sql
 SELECT vd.*, vo.visit_concept_id, vo.visit_start_date
-    FROM visit_detail vd
-    JOIN visit_occurrence vo ON vd.visit_occurrence_id = vo.visit_occurrence_id
-    WHERE vd.visit_detail_concept_id = 32037
+FROM visit_detail vd
+JOIN visit_occurrence vo ON vd.visit_occurrence_id = vo.visit_occurrence_id
+WHERE vd.visit_detail_concept_id = 32037
 ```
 
 ```sql
-with visit_occurrence
-    SELECT * FROM visit_detail
-    WHERE visit_occurrence_id IN (
-        SELECT visit_occurrence_id FROM visit_occurrence
-        WHERE visit_concept_id = 9201  -- Inpatient visits
-    )
+SELECT * FROM visit_detail
+WHERE visit_occurrence_id IN (
+    SELECT visit_occurrence_id FROM visit_occurrence
+    WHERE visit_concept_id = 9201
+)
 ```
 
 #### Suggested fix
 
-Ensure visit_detail is correctly linked to visit_occurrence via visit_occurrence_id when visit-level context is needed
+Join on the foreign key:
+`JOIN visit_occurrence vo ON vd.visit_occurrence_id = vo.visit_occurrence_id`.
+Any other join key will produce a within-person fan-out.
 
 ---
 

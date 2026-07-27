@@ -247,6 +247,11 @@ _VALID_TOP_LEVEL_STATEMENTS: Tuple[type, ...] = (
     exp.Show,
     exp.Pragma,
     exp.TruncateTable,
+    # Planner-stats maintenance — semantically a no-op for validation
+    # but legal SQL. OHDSI Achilles emits ``ANALYZE <table>`` between
+    # CTAS and downstream selects; rejecting it as a parse error
+    # buries real findings in noise.
+    exp.Analyze,
 )
 
 
@@ -357,23 +362,24 @@ def _is_descendant_of(node: exp.Expression, root: Optional[exp.Expression]) -> b
 
 def _is_shadowed_by_visible_cte(table_node: exp.Table, target: str) -> bool:
     """True if a CTE named ``target`` is defined in a WITH clause attached
-    to any ``Select`` ancestor of ``table_node`` — i.e. visible per
-    standard SQL lexical scoping. Excludes the case where ``table_node``
-    is *inside* the CTE's own body (a non-recursive CTE doesn't see
-    itself; ``WITH RECURSIVE`` is rare in OMOP analytics and would
-    require deeper handling, so the simple non-recursive rule is the
-    safe default here).
+    to any ancestor of ``table_node`` — i.e. visible per standard SQL
+    lexical scoping. Excludes the case where ``table_node`` is *inside*
+    the CTE's own body (a non-recursive CTE doesn't see itself;
+    ``WITH RECURSIVE`` is rare in OMOP analytics and would require deeper
+    handling, so the simple non-recursive rule is the safe default here).
 
-    Walks up through ancestor ``Select`` scopes one at a time so that
-    a CTE defined in a nested subquery is NOT mistakenly treated as
-    shadowing an outer table reference.
+    Checks the ``with_`` slot on EVERY ancestor, not just ``Select``
+    nodes: sqlglot attaches the WITH of ``WITH x AS (…) SELECT … UNION
+    SELECT … FROM x`` to the ``Union`` node, and ``WITH x AS (…) INSERT
+    INTO t SELECT … FROM x`` hangs it off the ``Insert`` — an earlier
+    Select-only walk missed both shapes and treated their CTE references
+    as real OMOP tables. Walking ancestors only (never siblings) still
+    guarantees a CTE defined in a nested subquery does NOT shadow an
+    outer table reference.
     """
-    cursor: Optional[exp.Expression] = table_node
+    cursor: Optional[exp.Expression] = table_node.parent
     while cursor is not None:
-        select = cursor.find_ancestor(exp.Select)
-        if select is None:
-            return False
-        with_clause = select.args.get("with_") or select.args.get("with")
+        with_clause = cursor.args.get("with_") or cursor.args.get("with")
         if with_clause is not None:
             for cte in with_clause.expressions or []:
                 if not cte.alias or normalize_name(cte.alias) != target:
@@ -383,9 +389,7 @@ def _is_shadowed_by_visible_cte(table_node: exp.Table, target: str) -> bool:
                 if _is_descendant_of(table_node, cte.this):
                     continue
                 return True
-        # Continue walking outward — but find_ancestor includes `cursor`
-        # itself if it matches, so step PAST `select` for the next round.
-        cursor = select.parent
+        cursor = cursor.parent
     return False
 
 
@@ -447,6 +451,82 @@ def resolve_table_col(col: exp.Column, aliases: Dict[str, str]) -> Tuple[str, st
         table_alias = normalize_name(col.table)
         table_name = aliases.get(table_alias, table_alias)
     return table_name, col_name
+
+
+_TEMPLATE_NOISE_RE = re.compile(
+    r"--[^\n]*"  # line comments
+    r"|/\*.*?\*/"  # block comments
+    r"|'(?:[^']|'')*'"  # single-quoted string literals (with '' escape)
+    r'|"(?:[^"]|"")*"',  # double-quoted identifiers / strings
+    re.DOTALL,
+)
+
+# Positions where ``@<word>`` is *syntactically impossible* as a TSQL
+# variable but normal for an unrendered SqlRender placeholder:
+#   * embedded inside an identifier (``tmpach_@domainId_cost_raw``)
+#   * as a qualifier before a dot (``@vocabDatabaseSchema.concept``)
+#   * as a qualified component after a dot (``B.@domainId_concept_id``)
+# TSQL ``@var`` is always a standalone token, never glued to a word
+# character or used in dotted notation, so these patterns avoid the
+# noisy "every DECLARE @cnt looks like a template" failure mode.
+_SQLRENDER_POSITIONAL_PATTERNS = (
+    re.compile(r"\w@[A-Za-z_]\w*"),  # word-boundary preceded by \w
+    re.compile(r"@[A-Za-z_]\w*\s*\."),  # @<word> followed by .
+    re.compile(r"\.\s*@[A-Za-z_]\w*"),  # . followed by @<word>
+)
+
+
+def looks_like_unrendered_template(sql: str) -> bool:
+    """True when ``sql`` looks like an unrendered OHDSI SqlRender template.
+
+    SqlRender (the OHDSI R package) substitutes ``@<identifier>``
+    placeholders into ``.sql.handlebars`` templates before execution.
+    Files that haven't been through that step are still legal-ish text
+    that sqlglot may even parse — but the resulting AST has placeholder
+    fragments where real identifiers belong, and every name-matching
+    rule (``data_quality.schema_validation``, etc.) ends up reporting
+    truthful-but-useless "table doesn't exist in CDM" errors.
+
+    The detector targets *syntactically-impossible* TSQL positions —
+    ``@<word>`` glued to a word character (``tmpach_@domainId_cost_raw``)
+    or appearing in dotted notation (``@schema.table``, ``alias.@col``).
+    TSQL ``@variable`` declarations never appear in those positions, so
+    a query like ``DECLARE @cnt INT; SELECT @cnt = COUNT(*) FROM t;`` is
+    NOT flagged. String literals (``'a@b.com'``) and comments
+    (``-- TODO @param``) are stripped before scanning so legitimate
+    @-characters inside quoted regions don't trip the detector.
+
+    Limitations: a template whose ONLY placeholders appear as bare,
+    standalone tokens (e.g. ``WHERE @col IS NOT NULL`` with no
+    structural marker anywhere in the file) is indistinguishable from
+    valid TSQL with declared variables; those slip through. In
+    practice OHDSI templates almost always include at least one
+    embedded or dotted placeholder.
+    """
+    if not sql or "@" not in sql:
+        return False
+    stripped = _TEMPLATE_NOISE_RE.sub(" ", sql)
+    return any(p.search(stripped) for p in _SQLRENDER_POSITIONAL_PATTERNS)
+
+
+def unwrap_cast(e: exp.Expression) -> exp.Expression:
+    """Peel ``CAST(...)`` and ``(...)`` wrappers and return the inner node.
+
+    OHDSI templates (Achilles, SqlRender output, etc.) routinely render
+    every literal as ``CAST('Drug' AS TEXT)`` / ``CAST('Drug' AS VARCHAR(255))``
+    because the underlying ``.sql.handlebars`` files have to type their
+    constants for Oracle, Redshift, BigQuery, etc. The wrapper is
+    semantically a no-op for our pattern matchers but breaks every
+    ``isinstance(rhs, exp.Literal)`` check. Use this helper anywhere the
+    rule wants to look through the wrapper at the actual literal /
+    column / function call inside.
+
+    Nested wrappers and parentheses are peeled until a non-wrapper node
+    is reached: ``((CAST('Drug' AS TEXT)))`` returns the inner Literal.
+    """
+    while isinstance(e, (exp.Cast, exp.Paren)):
+        e = e.this
+    return e
 
 
 def is_string_literal(e: exp.Expression) -> bool:
@@ -637,15 +717,85 @@ def extract_join_conditions(tree: exp.Expression, aliases: Dict[str, str]) -> Li
     return join_conditions
 
 
+def collect_locally_defined_tables(sql: str, dialect: str = "postgres") -> "frozenset[str]":
+    """Names of tables introduced by ``CREATE TABLE`` / ``CREATE VIEW``
+    anywhere in ``sql``.
+
+    Used to seed ``ValidationContext.local_tables`` before per-statement
+    validation so the schema rule doesn't flag intra-batch scratch
+    tables (OHDSI Achilles: ``CREATE TABLE scratch.tempResults_104 AS …;
+    SELECT … FROM tempResults_104;``) as unknown OMOP tables.
+
+    Splits the input first and parses each statement independently so
+    one unparseable statement (Achilles still has the occasional
+    unrendered ``@param`` template) doesn't poison the whole pool —
+    we want every successfully-parsed ``CREATE`` to contribute to the
+    scope even when neighbours fail. Names are lowercased to match
+    ``CDM_COLUMN_TYPES`` and the rule's case-insensitive comparison;
+    schema qualifiers are stripped so ``scratch.tempResults_104`` is
+    stored as ``tempresults_104``.
+    """
+    return frozenset(normalize_name(t.name) for t, _create in _iter_created_tables(sql, dialect))
+
+
+def collect_locally_defined_unqualified_tables(sql: str, dialect: str = "postgres") -> "frozenset[str]":
+    """Names of tables created *without* a schema qualifier (or with a
+    TEMP/TEMPORARY modifier) anywhere in ``sql``.
+
+    This is the subset of :func:`collect_locally_defined_tables` that is
+    safe to treat as *shadowing* a protected OMOP name for
+    ``anti_patterns.destructive_operations_on_clinical_tables``: an
+    unqualified ``CREATE TEMP TABLE death AS …`` earlier in the batch
+    means a later unqualified ``DROP TABLE death`` targets the scratch
+    table. A schema-qualified create (``CREATE TABLE backup.death AS …``)
+    must NOT qualify — it defines ``backup.death``, so an unqualified
+    ``DELETE FROM death`` still resolves to the clinical table on the
+    search path and must keep firing.
+    """
+    names: set[str] = set()
+    for table, create in _iter_created_tables(sql, dialect):
+        is_qualified = bool(table.args.get("db") or table.args.get("catalog"))
+        props = create.args.get("properties")
+        is_temp = any(isinstance(p, exp.TemporaryProperty) for p in (props.expressions if props else []))
+        if not is_qualified or is_temp:
+            names.add(normalize_name(table.name))
+    return frozenset(names)
+
+
+def _iter_created_tables(sql: str, dialect: str) -> "list[Tuple[exp.Table, exp.Create]]":
+    """Every ``(target Table node, enclosing Create)`` pair in ``sql``,
+    parsed statement-by-statement so one bad statement doesn't poison
+    the rest (see ``collect_locally_defined_tables``)."""
+    out: "list[Tuple[exp.Table, exp.Create]]" = []
+    for stmt in split_sql_statements(sql) or [sql]:
+        trees, _err = parse_sql(stmt, dialect)
+        if not trees:
+            continue
+        for tree in trees:
+            if tree is None:
+                continue
+            for create in tree.find_all(exp.Create):
+                target = create.this
+                if isinstance(target, exp.Schema):
+                    target = target.this
+                if isinstance(target, exp.Table) and target.name:
+                    out.append((target, create))
+    return out
+
+
 __all__ = [
     "split_sql_statements",
     "detect_dialect",
     "looks_like_prose",
     "normalize_name",
     "parse_sql",
+    "collect_locally_defined_tables",
+    "collect_locally_defined_unqualified_tables",
     "extract_aliases",
     "collect_cte_names",
     "resolve_table_col",
+    "looks_like_unrendered_template",
+    "unwrap_cast",
     "is_string_literal",
     "is_numeric_literal",
     "has_table_reference",
