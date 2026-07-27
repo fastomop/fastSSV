@@ -15,7 +15,22 @@ from fastssv.core.base import Rule, RuleViolation, Severity
 from fastssv.core.helpers import normalize_name, parse_sql
 from fastssv.core.patch import locate, replace as patch_replace
 from fastssv.core.registry import register
+from fastssv.core.validation_context import get_validation_context
 from fastssv.schemas import CDM_COLUMN_TYPES, get_table_columns
+
+
+# Statement types whose `this=Table(…)` slot is the *target* of a DDL /
+# maintenance op (i.e. the SQL is defining / dropping / modifying the
+# table itself, not querying it). The schema rule must not validate
+# these targets against the OMOP catalog — they're the SQL's own
+# scratch namespace (CTAS targets, ``ANALYZE tempResults_104``, etc.).
+_DDL_TARGET_PARENTS = (
+    exp.Create,
+    exp.Drop,
+    exp.Alter,
+    exp.Analyze,
+    exp.TruncateTable,
+)
 
 
 # Schema predicates derived from CDM_COLUMN_TYPES. Inlining them as small
@@ -236,6 +251,26 @@ class ComprehensiveSchemaValidationRule(Rule):
         if error:
             return []
 
+        # Cross-statement scope: names defined by `CREATE TABLE` elsewhere
+        # in the same batch (seeded onto the context by CLI/API runners),
+        # plus names defined *within* this rule's own input (combined /
+        # multi-tree case). Both contribute "tables that exist for this
+        # validation pass but aren't part of OMOP" so downstream references
+        # don't get flagged as unknown OMOP tables.
+        ctx = get_validation_context()
+        local_tables: Set[str] = set(ctx.local_tables)
+        for tree in trees:
+            if tree is None:
+                continue
+            for create in tree.find_all(exp.Create):
+                target = create.this
+                if isinstance(target, exp.Table) and target.name:
+                    local_tables.add(_norm(target.name))
+                elif isinstance(target, exp.Schema):
+                    inner = target.this
+                    if isinstance(inner, exp.Table) and inner.name:
+                        local_tables.add(_norm(inner.name))
+
         for tree in trees:
             if not tree:
                 continue
@@ -259,6 +294,16 @@ class ComprehensiveSchemaValidationRule(Rule):
                 if not table_name:
                     continue
 
+                # Skip DDL / maintenance targets — the table is being
+                # defined, dropped, altered, analyzed, or truncated here,
+                # not referenced. Patterns this covers:
+                #   CREATE TABLE scratch.tmpach_0 AS SELECT … FROM cdm.person
+                #   DROP TABLE scratch.tempResults_104
+                #   ANALYZE tempResults_104
+                # OHDSI Achilles emits all three against a scratch namespace.
+                if isinstance(table.parent, _DDL_TARGET_PARENTS):
+                    continue
+
                 # Skip schema-qualified tables (@vocab.concept -> concept)
                 if "." in table_name:
                     table_name = table_name.split(".")[-1]
@@ -269,6 +314,12 @@ class ComprehensiveSchemaValidationRule(Rule):
 
                 # Skip subquery aliases - they're derived tables
                 if table_name in subquery_aliases:
+                    continue
+
+                # Skip tables defined elsewhere in the same batch
+                # (CLI/API populate ``local_tables`` from earlier CREATE TABLE
+                # statements; we also collected in-tree CREATEs above).
+                if table_name in local_tables:
                     continue
 
                 table_key = table_name
@@ -329,6 +380,11 @@ class ComprehensiveSchemaValidationRule(Rule):
                     # Skip CTE / subquery references at the alias-name layer.
                     if table_ref in cte_names or table_ref in subquery_aliases:
                         continue
+                    # Same for locally-defined (intra-batch) tables — we
+                    # don't have column-type info for them, so any column
+                    # check would be a guess.
+                    if table_ref in local_tables:
+                        continue
 
                     resolved_table = _resolve_column_table(column) or table_ref
                     if "." in resolved_table:
@@ -337,6 +393,8 @@ class ComprehensiveSchemaValidationRule(Rule):
                     # After resolution, the underlying name may itself be a
                     # CTE / subquery (alias points at one).
                     if resolved_table in cte_names or resolved_table in subquery_aliases:
+                        continue
+                    if resolved_table in local_tables:
                         continue
                 else:
                     # No table qualifier - try to infer from context (single table in FROM)

@@ -83,15 +83,41 @@ class TestStandardConceptMapping:
         main_errors = [e for e in errors if not e.startswith("Warning:")]
         assert main_errors == []
 
-    def test_query_without_standard_enforcement(self) -> None:
-        """Query using standard fields without enforcement should fail."""
+    def test_default_mode_trusts_etl_on_bare_concept_id(self) -> None:
+        """Default-mode redesign (CDM v5.4-aligned): bare ``<event>_concept_id``
+        references without a vocabulary-table join are trusted — the CDM
+        spec requires the ETL to populate these with standard concepts,
+        and every OHDSI analytical tool (Achilles, Atlas-generated SQL,
+        HADES) writes SQL this way. The rule used to fire here with
+        WARNING severity; that produced 119 false positives on a single
+        OHDSI Achilles batch and obscured genuine issues. Strict mode
+        still fires on the same pattern — see
+        ``test_strict_mode_fires_on_bare_concept_id``.
+        """
         sql = """
         SELECT co.condition_concept_id
         FROM condition_occurrence co
         """
         errors = validate_standard_concept_mapping(sql)
-        assert len(errors) > 0
-        assert any("STANDARD concept fields" in e for e in errors)
+        assert all("STANDARD concept fields" not in e for e in errors)
+
+    def test_strict_mode_fires_on_bare_concept_id(self) -> None:
+        """Strict-mode preservation: the original broad check remains
+        available for ETL validation / new-dataset distrust. Same SQL as
+        the default-mode test, opt-in via ``with_strict_mode``."""
+        from fastssv.core.registry import get_rule
+        from fastssv.core.validation_context import with_strict_mode
+
+        rule = get_rule("concept_standardization.standard_concept_enforcement")()
+        sql = """
+        SELECT co.condition_concept_id
+        FROM condition_occurrence co
+        """
+        with with_strict_mode(True):
+            violations = rule.validate(sql)
+        assert len(violations) == 1
+        assert "STANDARD concept fields" in violations[0].message
+        assert violations[0].severity == Severity.ERROR  # strict mode escalates
 
     def test_query_with_standard_concept_in_join_on(self) -> None:
         """Query with standard_concept = 'S' in JOIN ON should pass."""
@@ -184,10 +210,12 @@ class TestStandardConceptMapping:
         errors = validate_standard_concept_mapping(sql)
         assert all("STANDARD concept fields" not in e for e in errors)
 
-    def test_subquery_from_unrelated_table_still_fires(self) -> None:
-        """Suppression must be specific to concept_ancestor, not any subquery.
-        `<col> IN (SELECT some_id FROM some_other_table)` carries no standard-
-        concept guarantee."""
+    def test_subquery_from_unrelated_table_silent_in_default_mode(self) -> None:
+        """``<col> IN (SELECT … FROM custom_lookup_table)`` — no vocabulary
+        table in scope, so default mode trusts the ETL on
+        ``condition_concept_id``. The pattern carries no standard-concept
+        guarantee (subquery isn't from concept_ancestor) so strict mode
+        does still fire, see the next test."""
         sql = """
         SELECT co.person_id
         FROM condition_occurrence co
@@ -196,7 +224,27 @@ class TestStandardConceptMapping:
         )
         """
         errors = validate_standard_concept_mapping(sql)
-        assert any("STANDARD concept fields" in e for e in errors)
+        assert all("STANDARD concept fields" not in e for e in errors)
+
+    def test_subquery_from_unrelated_table_fires_in_strict_mode(self) -> None:
+        """Strict-mode preservation of the concept_ancestor-specificity
+        guard: the IN-subquery-from-unrelated-table pattern carries no
+        standard-concept guarantee, and strict mode flags it."""
+        from fastssv.core.registry import get_rule
+        from fastssv.core.validation_context import with_strict_mode
+
+        rule = get_rule("concept_standardization.standard_concept_enforcement")()
+        sql = """
+        SELECT co.person_id
+        FROM condition_occurrence co
+        WHERE co.condition_concept_id IN (
+            SELECT concept_id FROM custom_lookup_table
+        )
+        """
+        with with_strict_mode(True):
+            violations = rule.validate(sql)
+        assert len(violations) == 1
+        assert "STANDARD concept fields" in violations[0].message
 
     def test_inline_join_to_concept_ancestor_descendant_suppresses(self) -> None:
         """The JOIN form of the cohort idiom — equally idiomatic in OHDSI:
@@ -360,15 +408,18 @@ class TestStandardConceptMapping:
 
     def test_suggested_fix_unchanged_without_cte_shadow(self) -> None:
         """Without a `concept` CTE in scope, the original (non-qualified)
-        suggested_fix message is preserved."""
+        suggested_fix message is preserved. SQL must touch a vocabulary
+        table (``concept`` here) to trigger the default-mode firing path —
+        the rule no longer fires on bare ``condition_concept_id`` filters
+        without vocab joins."""
         from fastssv.core.registry import get_rule
 
         rule = get_rule("concept_standardization.standard_concept_enforcement")()
         sql = """
         SELECT co.person_id
         FROM omop.condition_occurrence co
-        JOIN omop.drug_exposure de ON co.person_id = de.person_id
-        WHERE co.condition_concept_id > 0;
+        JOIN omop.concept c ON co.condition_concept_id = c.concept_id
+        WHERE c.vocabulary_id = 'SNOMED';
         """
         violations = rule.validate(sql)
         assert len(violations) >= 1
@@ -376,6 +427,126 @@ class TestStandardConceptMapping:
         # Suggestion should be the plain `JOIN concept c` form (no schema prefix).
         assert "omop.concept" not in fix, fix
         assert "JOIN concept c" in fix, fix
+
+    # ---- Source concept enforcement (always-on, default + strict) ----
+
+    def test_source_concept_id_without_mapping_fires(self) -> None:
+        """``*_source_concept_id`` is the CDM's pre-mapping layer and may
+        be non-standard. Using it analytically without a ``Maps to``
+        mapping or a specific literal filter mixes vocabulary layers and
+        produces non-reproducible cohorts."""
+        from fastssv.core.registry import get_rule
+
+        rule = get_rule("concept_standardization.standard_concept_enforcement")()
+        sql = """
+        SELECT co.person_id, co.condition_source_concept_id
+        FROM condition_occurrence co
+        WHERE co.person_id > 0
+        """
+        violations = rule.validate(sql)
+        assert len(violations) == 1
+        assert "source concept-id" in violations[0].message.lower()
+        assert violations[0].severity == Severity.WARNING
+
+    def test_source_concept_id_with_maps_to_suppresses(self) -> None:
+        """``JOIN concept_relationship cr ON cr.concept_id_1 = source_col
+        AND cr.relationship_id = 'Maps to'`` is the canonical OMOP fix.
+        Once the user has wired that up, no more warning."""
+        from fastssv.core.registry import get_rule
+
+        rule = get_rule("concept_standardization.standard_concept_enforcement")()
+        sql = """
+        SELECT cr.concept_id_2 AS mapped_standard
+        FROM condition_occurrence co
+        JOIN concept_relationship cr
+          ON cr.concept_id_1 = co.condition_source_concept_id
+         AND cr.relationship_id = 'Maps to'
+        """
+        assert rule.validate(sql) == []
+
+    def test_source_concept_id_with_specific_literal_filter_suppresses(self) -> None:
+        """Filtering the source column by literal IDs is explicit
+        source-value intent — the user has chosen specific source codes
+        and doesn't need standard-mapping enforcement."""
+        from fastssv.core.registry import get_rule
+
+        rule = get_rule("concept_standardization.standard_concept_enforcement")()
+        sql = "SELECT * FROM condition_occurrence WHERE condition_source_concept_id = 4112343"
+        assert rule.validate(sql) == []
+
+    def test_source_concept_id_fires_independently_of_standard_fields(self) -> None:
+        """A query that uses *both* a source concept (unmapped) and a
+        bare standard concept (no vocab context) should warn on the
+        source concept regardless of the standard-concept default-mode
+        suppression. The two branches are independent."""
+        from fastssv.core.registry import get_rule
+
+        rule = get_rule("concept_standardization.standard_concept_enforcement")()
+        sql = """
+        SELECT co.condition_concept_id, co.condition_source_concept_id
+        FROM condition_occurrence co
+        """
+        violations = rule.validate(sql)
+        # Only the source-concept warning should fire — standard-concept
+        # branch is suppressed in default mode without a vocab join.
+        assert len(violations) == 1
+        assert "source concept-id" in violations[0].message.lower()
+
+    # ---- Vocabulary-context firing on standard concepts (default mode) ----
+
+    def test_vocabulary_join_without_standard_filter_fires_in_default_mode(self) -> None:
+        """When the query already joins to ``concept`` (or
+        ``concept_ancestor`` / ``concept_relationship``), the result rows
+        span the standardness hierarchy unless the join filters by
+        ``standard_concept = 'S'``. Default mode fires here even though
+        it trusts the ETL on bare ``<event>_concept_id`` references —
+        vocabulary context is the high-stakes case."""
+        from fastssv.core.registry import get_rule
+
+        rule = get_rule("concept_standardization.standard_concept_enforcement")()
+        sql = """
+        SELECT co.person_id
+        FROM condition_occurrence co
+        JOIN concept c ON co.condition_concept_id = c.concept_id
+        WHERE c.vocabulary_id = 'SNOMED'
+        """
+        violations = rule.validate(sql)
+        assert len(violations) == 1
+        assert "vocabulary tables" in violations[0].message.lower()
+        assert violations[0].severity == Severity.WARNING
+
+    def test_vocabulary_join_with_standard_filter_passes_in_default_mode(self) -> None:
+        """Vocabulary context + explicit ``standard_concept = 'S'`` filter
+        — the canonical correct pattern."""
+        from fastssv.core.registry import get_rule
+
+        rule = get_rule("concept_standardization.standard_concept_enforcement")()
+        sql = """
+        SELECT co.person_id
+        FROM condition_occurrence co
+        JOIN concept c ON co.condition_concept_id = c.concept_id
+        WHERE c.vocabulary_id = 'SNOMED' AND c.standard_concept = 'S'
+        """
+        assert rule.validate(sql) == []
+
+    def test_achilles_visit_concept_id_stratification_silent_in_default_mode(self) -> None:
+        """The OHDSI Achilles ``tmpach_200``-style query: groups by
+        ``visit_concept_id``, no vocabulary join. CDM v5.4 spec
+        guarantees ``visit_concept_id`` is a standard concept; Achilles
+        trusts the ETL and re-checking is redundant. Default mode must
+        stay silent — this was the canonical false-positive class.
+        """
+        from fastssv.core.registry import get_rule
+
+        rule = get_rule("concept_standardization.standard_concept_enforcement")()
+        sql = """
+        CREATE TABLE scratch.tmpach_200 AS
+        SELECT vo.visit_concept_id, COUNT(DISTINCT vo.person_id) AS n
+        FROM cdm.visit_occurrence vo
+        JOIN cdm.observation_period op ON vo.person_id = op.person_id
+        GROUP BY vo.visit_concept_id
+        """
+        assert rule.validate(sql) == []
 
     def test_suggested_fix_unchanged_when_concept_cte_is_nested_subquery(self) -> None:
         """A `concept` CTE defined INSIDE a nested subquery (IN / EXISTS /
@@ -3906,6 +4077,78 @@ class TestSchemaValidation:
         violations = self._run_rule(sql)
         assert violations == []
 
+    def test_ctas_target_not_validated_as_omop_table(self) -> None:
+        """``CREATE TABLE … AS SELECT`` defines its target — the target name
+        isn't a reference, so it shouldn't be required to exist in OMOP.
+        Regression: OHDSI Achilles emits ``CREATE TABLE scratch.tmpach_N AS
+        SELECT … FROM cdm.<omop_table>`` and the validator previously flagged
+        the scratch target as a nonexistent OMOP table.
+        """
+        sql = (
+            "CREATE TABLE scratch.tmpach_0 AS "
+            "SELECT 0 AS analysis_id, COUNT(distinct person_id) AS count_value "
+            "FROM cdm.person"
+        )
+        violations = self._run_rule(sql)
+        assert violations == []
+
+    def test_ctas_still_validates_source_tables(self) -> None:
+        """Skipping CTAS targets must not also skip the SELECT source — a
+        misspelled source table should still error.
+        """
+        sql = (
+            "CREATE TABLE scratch.tmpach_0 AS "
+            "SELECT person_id FROM cdm.persn"
+        )
+        violations = self._run_rule(sql)
+        assert len(violations) == 1
+        assert "persn" in violations[0].message
+
+    def test_analyze_target_not_flagged(self) -> None:
+        """``ANALYZE <table>`` is a planner-stats maintenance op against a
+        table the SQL itself created earlier in the batch. The target
+        shouldn't be checked against OMOP — same shape as the CTAS-target
+        skip.
+        """
+        sql = "ANALYZE tempResults_104"
+        violations = self._run_rule(sql)
+        assert violations == []
+
+    def test_drop_table_target_not_flagged(self) -> None:
+        """Same rationale applies to ``DROP TABLE`` of a scratch table."""
+        sql = "DROP TABLE scratch.tempResults_104"
+        violations = self._run_rule(sql)
+        assert violations == []
+
+    def test_cross_statement_scope_combined_input(self) -> None:
+        """When the rule sees multiple statements at once (combined-mode
+        invocation), a table created earlier in the same input must be
+        treated as known for downstream references — Achilles emits
+        ``CREATE TABLE scratch.tempResults_104 AS …; SELECT … FROM
+        tempResults_104;`` and the downstream SELECT must not flag
+        ``tempResults_104`` as a missing OMOP table.
+        """
+        sql = (
+            "CREATE TABLE scratch.tempResults_104 AS "
+            "SELECT person_id FROM cdm.person;\n"
+            "SELECT * FROM tempResults_104;"
+        )
+        violations = self._run_rule(sql)
+        assert violations == []
+
+    def test_cross_statement_scope_via_context(self) -> None:
+        """Per-statement validation (CLI/API batch mode) calls the rule once
+        per statement, so cross-statement scope must come from
+        ``ValidationContext.local_tables`` rather than the input itself.
+        """
+        from fastssv.core.validation_context import with_local_tables
+        sql = "SELECT * FROM tempResults_104"
+        # Outside the context: still unknown (real OMOP misspelling case).
+        assert len(self._run_rule(sql)) == 1
+        # Inside the context: treated as known.
+        with with_local_tables(frozenset({"tempresults_104"})):
+            assert self._run_rule(sql) == []
+
 
 class TestColumnTypeValidation:
     """Tests for column type validation rule (OMOP_004, 005, 024, 025, 026, 105)."""
@@ -4458,42 +4701,77 @@ class TestVisitEventTemporalValidation:
 
 
 class TestVisitDetailVisitOccurrenceReference:
-    """Tests for visit_detail visit_occurrence reference rule (CLIN_044)."""
+    """Tests for visit_detail / visit_occurrence linkage rule (CLIN_044).
+
+    The rule fires only when both tables are referenced but not joined on
+    ``visit_occurrence_id``. Detail-only analyses (Achilles 1303/1306/1313)
+    are intentionally allowed — visit_detail carries its own person_id and
+    dates, and column-on-wrong-table mistakes are caught by
+    ``data_quality.schema_validation`` instead.
+    """
 
     def _run_rule(self, sql: str) -> list:
-        """Run visit_detail visit_occurrence reference rule."""
         from fastssv.core.registry import get_rule
         rule = get_rule("domain_specific.visit_detail_visit_occurrence_reference")()
         return rule.validate(sql)
 
-    # CLIN_044: visit_detail should reference visit_occurrence for context
-
-    def test_clin_044_visit_detail_alone_warns(self) -> None:
-        """visit_detail without visit_occurrence should warn (CLIN_044)."""
+    def test_clin_044_visit_detail_alone_passes(self) -> None:
+        """Detail-only query (Achilles-style) must not fire."""
         sql = """
         SELECT person_id, visit_detail_start_date
         FROM visit_detail
         WHERE visit_detail_concept_id = 32037
         """
-        violations = self._run_rule(sql)
-        assert len(violations) == 1
-        assert violations[0].severity.name == "ERROR"
-        assert "visit_detail" in violations[0].message.lower()
-        assert "visit_occurrence" in violations[0].message.lower()
+        assert self._run_rule(sql) == []
 
-    def test_clin_044_visit_detail_with_join_passes(self) -> None:
-        """visit_detail with visit_occurrence JOIN should pass (CLIN_044)."""
+    def test_clin_044_visit_detail_count_alone_passes(self) -> None:
+        """Aggregating visit_detail alone is fine — counting detail rows is a real analysis."""
+        assert self._run_rule("SELECT COUNT(*) FROM visit_detail") == []
+
+    def test_clin_044_visit_detail_with_other_tables_passes(self) -> None:
+        """Joining visit_detail to person without visit_occurrence is fine."""
+        sql = """
+        SELECT vd.*, p.gender_concept_id
+        FROM visit_detail vd
+        JOIN person p ON vd.person_id = p.person_id
+        WHERE vd.visit_detail_concept_id = 32037
+        """
+        assert self._run_rule(sql) == []
+
+    def test_clin_044_distinct_concept_count_per_person_passes(self) -> None:
+        """Achilles analysis 1303: count distinct vd concepts per person, observation-period scoped."""
+        sql = """
+        WITH rawData(person_id, count_value) AS (
+            SELECT vd.person_id, COUNT(DISTINCT vd.visit_detail_concept_id) AS count_value
+            FROM visit_detail vd
+            JOIN observation_period op ON vd.person_id = op.person_id
+              AND vd.visit_detail_start_date >= op.observation_period_start_date
+              AND vd.visit_detail_start_date <= op.observation_period_end_date
+            GROUP BY vd.person_id
+        )
+        SELECT MIN(count_value), MAX(count_value) FROM rawData
+        """
+        assert self._run_rule(sql) == []
+
+    def test_clin_044_proper_join_passes(self) -> None:
         sql = """
         SELECT vd.person_id, vd.visit_detail_start_date, vo.visit_concept_id
         FROM visit_detail vd
         JOIN visit_occurrence vo ON vd.visit_occurrence_id = vo.visit_occurrence_id
         WHERE vd.visit_detail_concept_id = 32037
         """
-        violations = self._run_rule(sql)
-        assert len(violations) == 0
+        assert self._run_rule(sql) == []
 
-    def test_clin_044_visit_detail_with_subquery_passes(self) -> None:
-        """visit_detail with visit_occurrence subquery should pass (CLIN_044)."""
+    def test_clin_044_comma_cross_join_with_where_passes(self) -> None:
+        """Old-style comma cross-join with WHERE linkage still counts."""
+        sql = """
+        SELECT vd.*, vo.*
+        FROM visit_detail vd, visit_occurrence vo
+        WHERE vd.visit_occurrence_id = vo.visit_occurrence_id
+        """
+        assert self._run_rule(sql) == []
+
+    def test_clin_044_subquery_with_visit_occurrence_id_passes(self) -> None:
         sql = """
         SELECT * FROM visit_detail
         WHERE visit_occurrence_id IN (
@@ -4501,49 +4779,9 @@ class TestVisitDetailVisitOccurrenceReference:
             WHERE visit_concept_id = 9201
         )
         """
-        violations = self._run_rule(sql)
-        assert len(violations) == 0
+        assert self._run_rule(sql) == []
 
-    def test_clin_044_visit_detail_with_other_tables_warns(self) -> None:
-        """visit_detail with other tables but no visit_occurrence should warn (CLIN_044)."""
-        sql = """
-        SELECT vd.*, p.gender_concept_id
-        FROM visit_detail vd
-        JOIN person p ON vd.person_id = p.person_id
-        WHERE vd.visit_detail_concept_id = 32037
-        """
-        violations = self._run_rule(sql)
-        assert len(violations) == 1
-        assert violations[0].severity.name == "ERROR"
-
-    def test_clin_044_no_visit_detail_passes(self) -> None:
-        """Query without visit_detail should pass (CLIN_044)."""
-        sql = """
-        SELECT * FROM visit_occurrence WHERE visit_concept_id = 9201
-        """
-        violations = self._run_rule(sql)
-        assert len(violations) == 0
-
-    def test_clin_044_visit_detail_count_without_context_warns(self) -> None:
-        """Aggregating visit_detail without visit_occurrence should warn (CLIN_044)."""
-        sql = """
-        SELECT COUNT(*) FROM visit_detail
-        """
-        violations = self._run_rule(sql)
-        assert len(violations) == 1
-
-    def test_clin_044_visit_detail_with_visit_occurrence_from_passes(self) -> None:
-        """visit_detail with visit_occurrence in FROM should pass (CLIN_044)."""
-        sql = """
-        SELECT vd.*, vo.*
-        FROM visit_detail vd, visit_occurrence vo
-        WHERE vd.visit_occurrence_id = vo.visit_occurrence_id
-        """
-        violations = self._run_rule(sql)
-        assert len(violations) == 0
-
-    def test_clin_044_complex_query_with_visit_occurrence_passes(self) -> None:
-        """Complex query with visit_occurrence in subquery should pass (CLIN_044)."""
+    def test_clin_044_correlated_exists_passes(self) -> None:
         sql = """
         SELECT vd.person_id, vd.visit_detail_start_date
         FROM visit_detail vd
@@ -4553,8 +4791,32 @@ class TestVisitDetailVisitOccurrenceReference:
               AND vo.visit_concept_id = 9201
         )
         """
+        assert self._run_rule(sql) == []
+
+    def test_clin_044_wrong_join_key_fires(self) -> None:
+        """Joining on person_id alone fans rows out within a person — the bug we now catch."""
+        sql = """
+        SELECT vd.*, vo.*
+        FROM visit_detail vd
+        JOIN visit_occurrence vo ON vd.person_id = vo.person_id
+        """
         violations = self._run_rule(sql)
-        assert len(violations) == 0
+        assert len(violations) == 1
+        assert violations[0].severity.name == "ERROR"
+        assert "visit_occurrence_id" in violations[0].message
+
+    def test_clin_044_cross_join_no_link_fires(self) -> None:
+        """visit_detail + visit_occurrence with no linking predicate at all is a cartesian — error."""
+        sql = """
+        SELECT vd.visit_detail_id, vo.visit_occurrence_id
+        FROM visit_detail vd, visit_occurrence vo
+        """
+        violations = self._run_rule(sql)
+        assert len(violations) == 1
+        assert violations[0].severity.name == "ERROR"
+
+    def test_clin_044_no_visit_detail_passes(self) -> None:
+        assert self._run_rule("SELECT * FROM visit_occurrence WHERE visit_concept_id = 9201") == []
 
 
 class TestVisitDetailDatesWithinParentVisit:
@@ -5056,6 +5318,108 @@ class TestCostTableDomainValidation:
         """
         violations = self._run_rule(sql)
         assert len(violations) == 0
+
+    # --- CAST/Paren-wrapped literal recognition (OHDSI cross-dialect templates) ---
+
+    def test_omop_038_cast_wrapped_literal_recognised(self) -> None:
+        """Achilles 1502 shape: ``CAST('Drug' AS TEXT)`` is the literal."""
+        sql = """
+        SELECT * FROM cost c
+        JOIN drug_exposure de ON c.cost_event_id = de.drug_exposure_id
+        WHERE c.cost_domain_id = CAST('Drug' AS TEXT)
+        """
+        assert self._run_rule(sql) == []
+
+    def test_omop_038_cast_wrapped_literal_wrong_domain_still_flagged(self) -> None:
+        """A wrapped-but-wrong domain literal must still produce a mismatch."""
+        sql = """
+        SELECT * FROM cost c
+        JOIN drug_exposure de ON c.cost_event_id = de.drug_exposure_id
+        WHERE c.cost_domain_id = CAST('Procedure' AS VARCHAR(255))
+        """
+        violations = self._run_rule(sql)
+        assert len(violations) == 1
+        assert "Cost domain mismatch" in violations[0].message
+
+    def test_omop_038_paren_wrapped_literal_recognised(self) -> None:
+        """``cost_domain_id = ('Drug')`` should pass — Paren peels too."""
+        sql = """
+        SELECT * FROM cost c
+        JOIN drug_exposure de ON c.cost_event_id = de.drug_exposure_id
+        WHERE c.cost_domain_id = ('Drug')
+        """
+        assert self._run_rule(sql) == []
+
+    def test_omop_038_in_clause_cast_values_recognised(self) -> None:
+        """``IN (CAST('Drug' AS TEXT))`` should pass — peel each IN value."""
+        sql = """
+        SELECT * FROM cost c
+        JOIN drug_exposure de ON c.cost_event_id = de.drug_exposure_id
+        WHERE c.cost_domain_id IN (CAST('Drug' AS TEXT), CAST('drug' AS TEXT))
+        """
+        assert self._run_rule(sql) == []
+
+
+class TestCostEventIdPolymorphicResolution:
+    """Tests for domain_specific.cost_event_id_polymorphic_resolution."""
+
+    def _run_rule(self, sql: str) -> list:
+        from fastssv.core.registry import get_rule
+        rule = get_rule("domain_specific.cost_event_id_polymorphic_resolution")()
+        return rule.validate(sql)
+
+    def test_join_without_domain_filter_fires(self) -> None:
+        sql = """
+        SELECT c.cost_id, de.drug_concept_id
+        FROM cost c
+        JOIN drug_exposure de ON c.cost_event_id = de.drug_exposure_id
+        """
+        violations = self._run_rule(sql)
+        assert len(violations) == 1
+        assert violations[0].severity.name == "ERROR"
+
+    def test_join_with_bare_literal_filter_passes(self) -> None:
+        sql = """
+        SELECT c.cost_id FROM cost c
+        JOIN drug_exposure de ON c.cost_event_id = de.drug_exposure_id
+        WHERE c.cost_domain_id = 'Drug'
+        """
+        assert self._run_rule(sql) == []
+
+    def test_join_with_cast_wrapped_filter_passes(self) -> None:
+        """Achilles 1502 shape: ``CAST('Drug' AS TEXT)`` counts as the filter."""
+        sql = """
+        SELECT c.cost_id FROM cost c
+        JOIN drug_exposure de ON c.cost_event_id = de.drug_exposure_id
+        WHERE c.cost_domain_id = CAST('Drug' AS TEXT)
+        """
+        assert self._run_rule(sql) == []
+
+    def test_join_with_paren_wrapped_filter_passes(self) -> None:
+        sql = """
+        SELECT c.cost_id FROM cost c
+        JOIN drug_exposure de ON c.cost_event_id = de.drug_exposure_id
+        WHERE c.cost_domain_id = ('Drug')
+        """
+        assert self._run_rule(sql) == []
+
+    def test_join_with_in_clause_cast_values_passes(self) -> None:
+        sql = """
+        SELECT c.cost_id FROM cost c
+        JOIN drug_exposure de ON c.cost_event_id = de.drug_exposure_id
+        WHERE c.cost_domain_id IN (CAST('Drug' AS TEXT))
+        """
+        assert self._run_rule(sql) == []
+
+    def test_no_cost_table_passes(self) -> None:
+        assert self._run_rule("SELECT * FROM drug_exposure WHERE drug_concept_id = 1") == []
+
+    def test_cost_event_id_in_select_only_passes(self) -> None:
+        """cost_event_id only in SELECT (not WHERE/JOIN) should not fire."""
+        sql = "SELECT cost_event_id FROM cost"
+        assert self._run_rule(sql) == []
+
+
 class TestCostCurrencyConceptId:
     """Tests for OMOP_112: cost_currency_concept_id_for_multi_currency."""
 
@@ -21084,6 +21448,72 @@ class TestDestructiveOperationsOnClinicalTables:
         assert len(violations) == 1
         assert "visit_detail" in violations[0].message.lower()
 
+    # --- Local-shadow exemption (Achilles 2004 pattern) ---
+
+    def test_gap_004_drop_locally_defined_shadow_passes(self) -> None:
+        """``CREATE TEMP TABLE death AS …`` earlier in the batch shadows the
+        OMOP name; the matching ``DROP TABLE death`` later is dropping the
+        scratch table, not the clinical one. The CLI/API populates
+        ``local_tables`` for exactly this cross-statement case."""
+        from fastssv.core.validation_context import with_local_tables
+        with with_local_tables(frozenset({"death"})):
+            assert self._run_rule("DROP TABLE death;") == []
+
+    def test_gap_004_drop_protected_without_shadow_still_fires(self) -> None:
+        """No local CREATE in the batch → no shadow → genuine bug → fire."""
+        assert len(self._run_rule("DROP TABLE death;")) == 1
+
+    def test_gap_004_schema_qualified_drop_still_fires_even_with_shadow(self) -> None:
+        """A schema qualifier (``cdm.death``) is unambiguous: that's the
+        real OMOP table, even if the batch also defines a local ``death``."""
+        from fastssv.core.validation_context import with_local_tables
+        with with_local_tables(frozenset({"death"})):
+            violations = self._run_rule("DROP TABLE cdm.death;")
+            assert len(violations) == 1
+            assert "death" in violations[0].message.lower()
+
+    def test_gap_004_insert_into_locally_defined_shadow_passes(self) -> None:
+        """The exemption isn't DROP-specific — INSERT into a shadowed name
+        is INSERT into the scratch table."""
+        from fastssv.core.validation_context import with_local_tables
+        with with_local_tables(frozenset({"death"})):
+            assert self._run_rule("INSERT INTO death (person_id) VALUES (1);") == []
+
+    def test_gap_004_schema_qualified_create_does_not_shadow(self) -> None:
+        """``CREATE TABLE backup.death AS …`` earlier in the batch defines
+        ``backup.death`` — the unqualified ``DELETE FROM death`` still hits
+        the clinical table on the search path and must keep firing. The
+        broad ``local_tables`` set (used by the schema rule) contains the
+        stripped name, but the destructive rule gates on the
+        ``local_unqualified_tables`` subset, which excludes it."""
+        from fastssv.core.validation_context import with_local_tables
+        with with_local_tables(frozenset({"death"}), unqualified_names=frozenset()):
+            violations = self._run_rule("DELETE FROM death;")
+            assert len(violations) == 1
+            assert "death" in violations[0].message.lower()
+
+    def test_gap_004_end_to_end_batch_collectors(self) -> None:
+        """End-to-end with the real collectors, as the CLI/API wire them:
+        a TEMP create shadows its DROP, a schema-qualified create does not
+        shadow an unqualified DELETE of the same base name."""
+        from fastssv.core.helpers import (
+            collect_locally_defined_tables,
+            collect_locally_defined_unqualified_tables,
+        )
+        from fastssv.core.validation_context import with_local_tables
+
+        batch = (
+            "CREATE TEMPORARY TABLE death AS SELECT DISTINCT person_id FROM cdm.death;\n"
+            "CREATE TABLE backup_schema.measurement AS SELECT * FROM cdm.measurement;\n"
+        )
+        local = collect_locally_defined_tables(batch)
+        unqualified = collect_locally_defined_unqualified_tables(batch)
+        with with_local_tables(local, unqualified):
+            assert self._run_rule("DROP TABLE death;") == []
+            violations = self._run_rule("DELETE FROM measurement;")
+            assert len(violations) == 1
+            assert "measurement" in violations[0].message.lower()
+
 
 # =============================================================================
 # GAP_005: Datetime BETWEEN with Date Literal Tests
@@ -21875,6 +22305,129 @@ class TestCommaSeparatedCrossJoin:
         violations = self._run_rule(sql)
         # measurement is not joined to co or de
         assert len(violations) > 0
+
+    # --- Theta-join / function-wrapped column recognition ---
+
+    def test_gap_035_range_predicate_counts_as_join(self) -> None:
+        """OHDSI Achilles joins event tables to time windows via range
+        predicates (`event_date BETWEEN window_start AND window_end`).
+        These are real joins — the rule must not flag them as Cartesian.
+        """
+        sql = """
+        SELECT * FROM measurement m, observation_period op
+        WHERE m.person_id = op.person_id
+          AND m.measurement_date BETWEEN op.observation_period_start_date AND op.observation_period_end_date
+        """
+        assert self._run_rule(sql) == []
+
+    def test_gap_035_inequality_join_recognised(self) -> None:
+        """Same idea via `<=` / `>=` instead of BETWEEN."""
+        sql = """
+        SELECT * FROM measurement m, observation_period op
+        WHERE op.observation_period_start_date <= m.measurement_date
+          AND op.observation_period_end_date >= m.measurement_date
+        """
+        assert self._run_rule(sql) == []
+
+    def test_gap_035_function_wrapped_join_columns(self) -> None:
+        """`EXTRACT(YEAR FROM op1.x) <= t1.y` — both columns are real
+        references, just wrapped in an EXTRACT call. The rule must see
+        through function wrappers."""
+        sql = """
+        SELECT 1
+        FROM cdm.person p1
+        INNER JOIN cdm.observation_period op1 ON p1.person_id = op1.person_id
+        , condition_occurrence t1
+        WHERE EXTRACT(YEAR FROM op1.observation_period_start_date) <= EXTRACT(YEAR FROM t1.condition_start_date)
+          AND EXTRACT(YEAR FROM op1.observation_period_end_date) >= EXTRACT(YEAR FROM t1.condition_start_date)
+        """
+        assert self._run_rule(sql) == []
+
+    def test_gap_035_comma_table_connected_via_inner_join_target(self) -> None:
+        """Achilles 116 shape: the comma-joined table is connected to the
+        scope through an INNER JOIN target (`observation_period`), not
+        directly to the FROM table (`person`). The rule must consider all
+        scope tables — not just other comma-set members — when checking
+        connectivity.
+        """
+        sql = """
+        SELECT 1
+        FROM cdm.person p1
+        INNER JOIN cdm.observation_period op1 ON p1.person_id = op1.person_id
+        , condition_occurrence t1
+        WHERE op1.observation_period_start_date <= t1.condition_start_date
+          AND op1.observation_period_end_date >= t1.condition_start_date
+        """
+        assert self._run_rule(sql) == []
+
+    def test_gap_035_on_clause_provides_connectivity(self) -> None:
+        """ON-clause predicates of explicit JOINs count too — a comma table
+        connected only via an INNER JOIN's ON predicate (rare but legal)
+        must not flag."""
+        sql = """
+        SELECT 1
+        FROM cdm.person p
+        INNER JOIN condition_occurrence co ON co.measurement_date = p.year_of_birth
+        , drug_exposure de
+        WHERE de.person_id = co.person_id
+        """
+        # de is connected to co via WHERE; should pass.
+        assert self._run_rule(sql) == []
+
+    def test_gap_035_three_way_one_unjoined_still_fires(self) -> None:
+        """When 2-of-3 comma tables are joined but the third is dangling,
+        the rule must still fire (and ideally name the offender)."""
+        sql = """
+        SELECT * FROM condition_occurrence a, drug_exposure b, measurement c
+        WHERE a.person_id = b.person_id
+        """
+        violations = self._run_rule(sql)
+        assert len(violations) == 1
+        # The unjoined table 'measurement' should appear in the message.
+        assert "measurement" in violations[0].message.lower()
+
+    # --- Unqualified-column attribution against the schema catalogue ---
+
+    def test_gap_035_achilles_1410_unqualified_scratch_columns(self) -> None:
+        """Achilles 1410: comma-joins a per-month scratch table and overlaps
+        ``payer_plan_period`` against its ``obs_month_start``/``obs_month_end``.
+        Achilles writes those scratch-table columns unqualified, which used
+        to false-fire — the rule now resolves them against the schema
+        catalogue (no OMOP scope table owns them → must be the lone
+        non-OMOP scope table)."""
+        sql = """
+        SELECT 1410 AS analysis_id, COUNT(DISTINCT p1.person_id) AS count_value
+        FROM person p1
+            INNER JOIN payer_plan_period ppp1 ON p1.person_id = ppp1.person_id
+            , temp_dates_1410
+        WHERE ppp1.payer_plan_period_start_date <= obs_month_start
+          AND ppp1.payer_plan_period_end_date   >= obs_month_end
+        GROUP BY obs_month
+        """
+        assert self._run_rule(sql) == []
+
+    def test_gap_035_unqualified_resolves_to_unique_omop_owner(self) -> None:
+        """An unqualified column that exists on exactly one scope table is
+        attributed to that table — so the predicate counts as a join."""
+        sql = """
+        SELECT 1
+        FROM measurement m, observation_period
+        WHERE measurement_date BETWEEN observation_period_start_date AND observation_period_end_date
+          AND m.person_id = observation_period.person_id
+        """
+        assert self._run_rule(sql) == []
+
+    def test_gap_035_ambiguous_unqualified_column_still_fires(self) -> None:
+        """``person_id`` is on every clinical table; without a qualifier or
+        any other linking predicate the rule must NOT silently accept the
+        join — the ambiguous case stays loud."""
+        sql = """
+        SELECT * FROM condition_occurrence, drug_exposure
+        WHERE person_id = 42
+        """
+        violations = self._run_rule(sql)
+        assert len(violations) == 1
+        assert "drug_exposure" in violations[0].message.lower()
 
 
 # --- GAP_036: UNION vs UNION ALL for Clinical Events ---
@@ -27520,3 +28073,138 @@ class TestLimitWithoutOrderBy:
         )
         violations = self._run_rule(sql)
         assert len(violations) == 1
+
+
+class TestDuplicateColumnAlias:
+    """Tests for `anti_patterns.duplicate_column_alias`."""
+
+    def _run_rule(self, sql: str) -> list:
+        from fastssv.core.registry import get_rule
+        rule = get_rule("anti_patterns.duplicate_column_alias")()
+        return rule.validate(sql)
+
+    def test_real_duplicate_expression_fires(self) -> None:
+        """Two columns computing the same non-trivial expression with
+        different aliases is the canonical copy-paste bug."""
+        sql = "SELECT person_id AS pid_a, person_id AS pid_b FROM person;"
+        violations = self._run_rule(sql)
+        assert len(violations) == 1
+        assert "pid_a" in violations[0].message
+        assert "pid_b" in violations[0].message
+
+    def test_typed_null_placeholders_suppressed(self) -> None:
+        """``CAST(NULL AS …)`` placeholders padding a fixed-schema CTAS /
+        INSERT target (OHDSI Achilles result-table idiom) must not be
+        flagged: differing aliases map to distinct destination columns,
+        not copy-paste duplication.
+        """
+        sql = (
+            "CREATE TABLE scratch.tmpach_0 AS "
+            "SELECT 0 AS analysis_id, "
+            "CAST('synpuf' AS VARCHAR(255)) AS stratum_1, "
+            "CAST(NULL AS VARCHAR(255)) AS stratum_4, "
+            "CAST(NULL AS VARCHAR(255)) AS stratum_5, "
+            "COUNT(distinct person_id) AS count_value "
+            "FROM cdm.person"
+        )
+        violations = self._run_rule(sql)
+        assert violations == []
+
+    def test_bare_null_placeholders_suppressed(self) -> None:
+        """Untyped bare ``NULL`` placeholders are the same idiom."""
+        sql = "SELECT person_id, NULL AS a, NULL AS b FROM person;"
+        violations = self._run_rule(sql)
+        assert violations == []
+
+    def test_null_suppression_does_not_mask_real_duplicates(self) -> None:
+        """When the same SELECT mixes NULL padding with a real duplicate,
+        the NULL group is suppressed but the real duplicate still fires.
+        """
+        sql = (
+            "SELECT NULL AS pad_a, NULL AS pad_b, "
+            "COUNT(*) AS c_one, COUNT(*) AS c_two FROM person;"
+        )
+        violations = self._run_rule(sql)
+        assert len(violations) == 1
+        assert "c_one" in violations[0].message
+        assert "c_two" in violations[0].message
+
+
+class TestPersonYearOfBirthAgeArithmetic:
+    """Tests for `domain_specific.year_of_birth_age_arithmetic`."""
+
+    def _run_rule(self, sql: str) -> list:
+        from fastssv.core.registry import get_rule
+        rule = get_rule("domain_specific.year_of_birth_age_arithmetic")()
+        return rule.validate(sql)
+
+    def test_cutoff_comparison_fires(self) -> None:
+        """High-stakes pattern: age computed from year_of_birth and then
+        compared to an integer cutoff. Off-by-one near the cutoff is a
+        real semantic error and must surface."""
+        sql = """
+        SELECT *
+        FROM person p
+        JOIN condition_occurrence co ON p.person_id = co.person_id
+        WHERE EXTRACT(YEAR FROM co.condition_start_date) - p.year_of_birth >= 65
+        """
+        v = self._run_rule(sql)
+        assert len(v) == 1
+        assert "year_of_birth" in v[0].message.lower()
+
+    def test_raw_age_projection_fires(self) -> None:
+        """Raw age projected as a stratum value (Achilles' default pattern
+        when not binning): off-by-one propagates into downstream usage, so
+        the warning is genuine."""
+        sql = """
+        SELECT EXTRACT(YEAR FROM op1.observation_period_start_date) - p1.year_of_birth AS age
+        FROM cdm.person p1
+        JOIN cdm.observation_period op1 ON p1.person_id = op1.person_id
+        """
+        assert len(self._run_rule(sql)) == 1
+
+    def test_decade_bin_suppressed(self) -> None:
+        """FLOOR((... - year_of_birth) / 10) is the Achilles decade-bin
+        idiom. Year-precision error is absorbed by the bucket width; one
+        person near a decade boundary slides between adjacent buckets,
+        which doesn't affect the analysis at population scale.
+        """
+        sql = """
+        SELECT FLOOR((EXTRACT(YEAR FROM vd.visit_detail_start_date) - p.year_of_birth) / 10) AS age_bucket
+        FROM cdm.person p
+        JOIN cdm.visit_detail vd ON p.person_id = vd.person_id
+        """
+        assert self._run_rule(sql) == []
+
+    def test_five_year_bin_suppressed(self) -> None:
+        """Quintile-width binning has the same harm-absorbing property as
+        decade bins; suppression threshold is N >= 5."""
+        sql = """
+        SELECT FLOOR((co.condition_start_date::INT - p.year_of_birth) / 5) AS five_year_band
+        FROM person p, condition_occurrence co
+        WHERE co.person_id = p.person_id
+        """
+        assert self._run_rule(sql) == []
+
+    def test_three_year_bin_still_fires(self) -> None:
+        """Narrow bins (N < 5) can't absorb year-level rounding the same way
+        — a one-year shift can still flip the bucket for a non-trivial
+        fraction of the cohort. Keep firing."""
+        sql = """
+        SELECT FLOOR((EXTRACT(YEAR FROM co.condition_start_date) - p.year_of_birth) / 3) AS narrow_band
+        FROM cdm.person p
+        JOIN cdm.condition_occurrence co ON p.person_id = co.person_id
+        """
+        assert len(self._run_rule(sql)) == 1
+
+    def test_achilles_116_decade_bin_suppressed(self) -> None:
+        """Concrete Achilles regression: the original `tmpach_116` query
+        that prompted the context-tier fix.
+        """
+        sql = """
+        CREATE TABLE scratch.tmpach_116 AS
+        SELECT floor((t1.obs_year - p1.year_of_birth)/10) AS stratum_3
+        FROM cdm.person p1, condition_occurrence t1
+        WHERE t1.person_id = p1.person_id
+        """
+        assert self._run_rule(sql) == []

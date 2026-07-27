@@ -33,6 +33,7 @@ from fastssv.core.helpers import (
     normalize_name,
     parse_sql,
     resolve_table_col,
+    unwrap_cast,
 )
 from fastssv.core.registry import register
 
@@ -86,11 +87,13 @@ def _has_cost_domain_id_filter(tree: exp.Expression, aliases: dict) -> bool:
         if not _is_cost_column(left, aliases, COST_DOMAIN_ID):
             continue
         if isinstance(node, exp.EQ):
-            right = node.expression
+            right = unwrap_cast(node.expression)
             if isinstance(right, exp.Literal) and right.is_string:
                 return True
         else:  # exp.In
-            if any(isinstance(v, exp.Literal) and v.is_string for v in (node.expressions or [])):
+            if any(
+                isinstance(unwrap_cast(v), exp.Literal) and unwrap_cast(v).is_string for v in (node.expressions or [])
+            ):
                 return True
     return False
 

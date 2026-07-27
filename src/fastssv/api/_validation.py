@@ -18,8 +18,12 @@ from fastssv import validate_sql_structured
 from fastssv.api.config import Settings
 from fastssv.api.models import QueryResult, ValidationResponse, Violation
 from fastssv.core.base import Severity
-from fastssv.core.helpers import split_sql_statements
-from fastssv.core.validation_context import with_strict_mode
+from fastssv.core.helpers import (
+    collect_locally_defined_tables,
+    collect_locally_defined_unqualified_tables,
+    split_sql_statements,
+)
+from fastssv.core.validation_context import with_local_tables, with_strict_mode
 
 logger = logging.getLogger("fastssv.api")
 
@@ -60,9 +64,16 @@ async def run_validation(
     # surface it.
     statements = split_sql_statements(sql) or [sql]
 
+    # Cross-statement scope: tables created elsewhere in the same submission
+    # are treated as known so per-statement schema validation doesn't flag
+    # intra-batch scratch tables as unknown OMOP tables. The unqualified
+    # subset separately gates the destructive-operations shadow exemption.
+    local_tables = collect_locally_defined_tables(sql, dialect)
+    local_unqualified = collect_locally_defined_unqualified_tables(sql, dialect)
+
     started = time.perf_counter()
     try:
-        with with_strict_mode(strict):
+        with with_strict_mode(strict), with_local_tables(local_tables, local_unqualified):
             per_query = await asyncio.wait_for(
                 asyncio.to_thread(_validate_each, statements, dialect),
                 timeout=settings.parse_timeout_seconds,

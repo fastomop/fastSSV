@@ -12,6 +12,10 @@ from typing import Any, Dict, List, Sequence
 
 from fastssv import validate_sql_structured
 from fastssv.core.base import RuleViolation, Severity
+from fastssv.core.helpers import (
+    collect_locally_defined_tables,
+    collect_locally_defined_unqualified_tables,
+)
 from fastssv.core.helpers import detect_dialect as _auto_detect_dialect
 from fastssv.core.helpers import split_sql_statements
 from fastssv.core.logging import (
@@ -276,16 +280,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.info(f"Auto-detected dialect: {dialect}")
         print(f"Auto-detected dialect: {dialect}")
 
-    # Set validation context for strict mode
+    # Set validation context for strict mode + cross-statement scope.
+    # Seed ``local_tables`` from the *whole* input — when the CLI iterates
+    # per-statement validation below, the schema rule still needs to know
+    # which scratch tables were created earlier in the batch (Achilles
+    # writes ``CREATE TABLE scratch.tempResults_N AS …`` once, then queries
+    # ``tempResults_N`` from many later statements).
     from fastssv.core.validation_context import ValidationContext, set_validation_context
 
+    local_tables = collect_locally_defined_tables(sql, dialect)
+    local_unqualified = collect_locally_defined_unqualified_tables(sql, dialect)
+    if local_tables:
+        logger.info(f"Detected {len(local_tables)} locally-defined tables across the batch")
+
+    context = ValidationContext(
+        strict_mode=args.strict,
+        dialect=dialect,
+        local_tables=local_tables,
+        local_unqualified_tables=local_unqualified,
+    )
+    set_validation_context(context)
     if args.strict:
-        set_validation_context(ValidationContext(strict_mode=True, dialect=dialect))
         logger.info("Strict mode enabled")
         print("Strict mode enabled: best-practice warnings escalated to errors")
     else:
         # Default mode: best practices are warnings, only correctness issues are errors
-        set_validation_context(ValidationContext(strict_mode=False, dialect=dialect))
         logger.info("Default validation mode (best practices = WARNING, correctness = ERROR)")
 
     if len(queries) <= 1 or args.combined:

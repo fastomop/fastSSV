@@ -58,7 +58,7 @@ def validate_sql(
             'dialect': str,              # The dialect actually used
         }
     """
-    from fastssv.core.helpers import parse_sql, detect_dialect
+    from fastssv.core.helpers import parse_sql, detect_dialect, looks_like_unrendered_template
 
     if dialect == "auto":
         dialect = detect_dialect(sql)
@@ -77,6 +77,13 @@ def validate_sql(
         "parse_error": None,
         "dialect": dialect,
     }
+
+    # Unrendered SqlRender templates are an input-shape mismatch; rules
+    # would just produce noise about placeholder fragments. Short-circuit
+    # with one structured WARNING before parsing.
+    if looks_like_unrendered_template(sql):
+        results["violations"].append(_make_template_skipped_violation())
+        return results
 
     # Check parse status up-front. If parsing fails, no rules can run, so
     # we return the parse error rather than a misleading empty result.
@@ -138,6 +145,36 @@ def validate_sql(
 
 PARSE_ERROR_RULE_ID = "parse.syntax_error"
 NOT_SQL_RULE_ID = "parse.not_sql_input"
+TEMPLATE_RULE_ID = "meta.unrendered_sqlrender_template"
+
+
+def _make_template_skipped_violation() -> RuleViolation:
+    """Build the single warning emitted when the input is a SqlRender template.
+
+    An unrendered template is a *category mismatch*, not a bug in the
+    query: the file is meant to be processed by SqlRender first to
+    substitute its ``@<identifier>`` placeholders. Running the rule
+    catalog against it would only produce truthful-but-useless
+    "table/column doesn't exist in CDM" errors for every placeholder
+    name. We short-circuit with one structured WARNING so consumers see
+    that fastssv noticed, why it skipped, and what to do about it.
+    """
+    return RuleViolation(
+        rule_id=TEMPLATE_RULE_ID,
+        severity=Severity.WARNING,
+        message=(
+            "Input contains unrendered SqlRender `@<identifier>` placeholders "
+            "(e.g. inside a table name or as a schema/column qualifier). "
+            "Rule validation was skipped — these files are templates, not "
+            "concrete SQL."
+        ),
+        suggested_fix=(
+            "REWRITE: run SqlRender first (``SqlRender::render(sql, ...)`` "
+            "in R, or the equivalent Java/Python port) to substitute every "
+            "@<param>, then re-submit the resulting SQL for validation."
+        ),
+        details={"category": "input_shape"},
+    )
 
 
 def _make_parse_error_violation(error_message: str, sql: str = "") -> RuleViolation:
@@ -215,10 +252,16 @@ def validate_sql_structured(
           the SQL could not be parsed; rules were not executed.
         - Multiple violations mean one or more rules detected issues.
     """
-    from fastssv.core.helpers import parse_sql, detect_dialect
+    from fastssv.core.helpers import parse_sql, detect_dialect, looks_like_unrendered_template
 
     if dialect == "auto":
         dialect = detect_dialect(sql)
+
+    # Unrendered SqlRender templates: short-circuit with a single WARNING
+    # rather than running the rule catalogue against placeholder fragments.
+    if looks_like_unrendered_template(sql):
+        _logger.info("Skipped rule execution: input is an unrendered SqlRender template")
+        return [_make_template_skipped_violation()]
 
     # Check parse status up-front so callers can distinguish clean SQL from
     # unparseable input. Individual rules also call parse_sql() internally and
