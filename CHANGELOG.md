@@ -11,6 +11,50 @@ between minor versions.
 
 ### Added
 
+- **Per-rule exception isolation, surfaced as `meta.rule_execution_error`.**
+  Previously every execution loop (`validate_sql`,
+  `validate_sql_structured`, the legacy category helpers) called
+  `rule.validate()` bare, so a single rule raising on an unusual AST shape
+  aborted the whole batch (library/CLI) or became a 500 (API). Each rule
+  now runs isolated: a raising rule is logged with its traceback, skipped,
+  and reported as a single WARNING violation with
+  `rule_id == "meta.rule_execution_error"` (new exported constant
+  `RULE_EXECUTION_ERROR_RULE_ID`) whose `details["failed_rule_id"]` names
+  the culprit. WARNING rather than ERROR because the *query* isn't known
+  to be wrong — the validator is — so a clean query doesn't flip to
+  INVALID over an internal bug. All other rules still run.
+
+- **API hardening knobs and headers.** Four additions to the FastAPI
+  service, each addressing a specific production gap:
+  - `FASTSSV_API_MAX_CONCURRENT_VALIDATIONS` (default 8): per-worker bound
+    on concurrent validation work. A timed-out validation keeps running on
+    its thread (CPU-bound sqlglot parses can't be cancelled), so under a
+    burst of adversarial slow-parse submissions the pool used to stay
+    pinned even after clients got 408s; the API and UI now fail fast with
+    503 + `Retry-After` when saturated instead.
+  - `FASTSSV_API_RATE_LIMIT_STORAGE_URI` (default empty = in-memory):
+    slowapi storage backend. The in-memory default is per-process — with N
+    gunicorn workers the effective limit is N × `FASTSSV_API_RATE_LIMIT`
+    and counters reset on restart; pointing this at a shared backend
+    (e.g. `redis://…`) makes the limit real across workers.
+  - `FASTSSV_API_TRUSTED_PROXY_HOSTS` (default `*`): which peers'
+    `X-Forwarded-For`/`-Proto` headers are trusted when
+    `FASTSSV_API_BEHIND_PROXY=true`. The previous hard-coded `*` let any
+    directly-reachable client spoof its IP (and rotate rate-limit buckets)
+    by forging `X-Forwarded-For`; operators should narrow this to the
+    proxy's IP/CIDR.
+  - A `Content-Security-Policy` header on every response
+    (`default-src 'self'`; inline scripts/styles allowed — the templates
+    use inline `<script>` blocks and `onclick=` handlers; all JS/CSS
+    assets are vendored under `/static`).
+  Also: `/v1/health` is now exempt from rate limiting so LB/kubelet
+  probes can't be throttled into 429s by client traffic sharing the same
+  source IP, and `deploy/docker-compose.yml` gained cgroup resource
+  ceilings (`mem_limit`/`cpus`/`pids_limit`, overridable via
+  `FASTSSV_MEM_LIMIT`/`FASTSSV_CPUS`) so a runaway parse is contained by
+  the kernel. New env vars are documented in `deploy/.env.example` and
+  wired through `deploy/docker-compose.yml`.
+
 - **New rule `anti_patterns.cte_shadows_omop_table`.** Warns when a CTE
   alias **or a derived-table subquery alias** collides with an OMOP CDM
   table name (`cohort`, `concept`, `person`, `condition_occurrence`,
@@ -367,6 +411,30 @@ between minor versions.
 
 ### Fixed
 
+- **The JSON log formatter now serializes every field passed via
+  `extra=`.** `JSONFormatter` previously emitted only a fixed allowlist
+  (`duration_ms`, `rule_id`, `violation_count`), silently dropping
+  everything else the API attaches — `request_id`, `sql_hash`, `dialect`,
+  `strict`, `query_count`, `client`, error/warning counts. In practice
+  that made request-ID correlation across log lines impossible even
+  though the middleware generates and returns `x-request-id` on every
+  response. All non-reserved record attributes are now included
+  (non-JSON-serializable values fall back to `repr()`), and the API log
+  calls in `/v1/validate` and the UI now also carry `request_id`.
+
+- **CLI: removed the phantom `--categories` choices `analytics`,
+  `performance`, and `schema`.** These were accepted by argparse but
+  matched zero registered rules, so e.g. `fastssv --categories schema
+  file.sql` ran nothing and reported `Validation VALID` — a silently
+  misleading false-clean. The valid choices are the six real categories
+  (`anti_patterns`, `concept_standardization`, `data_quality`,
+  `domain_specific`, `joins`, `temporal`).
+
+- **CLI: a missing or unreadable SQL file now prints a one-line
+  `error: cannot read SQL from …` message and exits with code 2** instead
+  of dumping a raw `FileNotFoundError` traceback. Exit codes are now:
+  0 valid, 1 invalid, 2 input/usage error.
+
 - **`anti_patterns.duplicate_column_alias` no longer fires on NULL /
   typed-NULL placeholder columns.** Wide-table INSERT / CTAS patterns
   — notably OHDSI Achilles, which funnels every analysis through the
@@ -420,6 +488,175 @@ between minor versions.
   `…test_suggested_fix_unchanged_when_concept_cte_is_nested_subquery`
   (the new case, added in response to a Copilot review flag that the
   earlier tree-global `collect_cte_names` over-approximated scope).
+
+### Fixed
+
+- **`data_quality.schema_validation` is now scope-aware for column
+  resolution.** `comprehensive_schema_validation` previously resolved
+  every `Column` ref through the global `extract_aliases` dict, which
+  is a flat name -> table map. When the same alias was used across
+  CTEs (for example `omop.concept c` inside one CTE and `cond_occ c` in
+  the outer SELECT), the dict collapsed to last-write-wins and the
+  rule misattributed columns — yielding spurious errors like
+  _"Column 'person_id' does not exist in table 'concept'"_ on
+  perfectly valid SQL. The rule now walks each `Column`'s enclosing
+  `Select` scope to build a scope-local alias map (correlated outer
+  scopes are still visible; inner scopes shadow). On a representative
+  11k-query benchmark this drops `schema_validation` errors from 341
+  to 131. The new helpers (`_local_aliases`, `_resolve_column_table`)
+  are private to the rule, since the global `extract_aliases` is still
+  the right contract for rules that work on join-condition pairs.
+  Regression test:
+  `tests/test_rules.py::TestSchemaValidation::test_alias_collision_across_ctes_does_not_false_positive`.
+
+- **`data_quality.schema_validation` no longer flags `DATEDIFF` unit
+  keywords as missing columns.** sqlglot parses `DATEDIFF(day, x, y)`
+  with `day` as a `Column` node (rather than a literal/Var). Without
+  filtering, the schema check produced
+  _"Column 'day' does not exist in table 'condition_occurrence'"_ for
+  every query that used `DATEDIFF`/`DATEADD`/`DATETRUNC`/`EXTRACT` etc.
+  The rule now skips unqualified `Column` nodes whose name is a
+  recognised time-unit keyword (`day`, `month`, `year`, `hour`,
+  `minute`, …) and whose parent is one of the date-arithmetic
+  function types. Regression test:
+  `tests/test_rules.py::TestSchemaValidation::test_datediff_unit_keyword_not_treated_as_column`.
+
+- **`joins.visit_occurrence_inner_join_validation` no longer warns on
+  non-VOID join keys.** OMOP_043's premise is that an `INNER JOIN
+  visit_occurrence ON event.visit_occurrence_id = vo.visit_occurrence_id`
+  silently drops the 20–60% of clinical events with NULL
+  `visit_occurrence_id`. That premise only applies when the JOIN key is
+  actually `visit_occurrence_id` — but `_is_vo_join` previously fired
+  on any INNER JOIN that *involved* `visit_occurrence`, regardless of
+  key. The canonical cohort-builder shape
+  `cohort c JOIN visit_occurrence vo ON c.person_id = vo.person_id`
+  (where `person_id` is NOT NULL on both sides and no rows can be
+  dropped due to NULL visit linkage) was therefore flagged as a
+  potentially-data-losing INNER JOIN. The rule now gates on a new
+  `_join_on_uses_visit_occurrence_id` check that walks `exp.EQ` nodes
+  in the ON clause and only returns True when `visit_occurrence_id`
+  appears on at least one side of an *equality* (not just anywhere in
+  the ON clause — an earlier draft walked every `exp.Column` and
+  reintroduced the same false positive class via non-equality
+  predicates like `vo.visit_occurrence_id IS NOT NULL` or
+  `vo.visit_occurrence_id > 0`; caught in code review). Mixed-key joins
+  (`ON co.visit_occurrence_id = vo.visit_occurrence_id AND co.person_id = vo.person_id`)
+  still fire because VOID linkage is in play. The implicit/comma-join
+  branch is unchanged — comma-joining `visit_occurrence` to an event
+  table almost always means visit linkage and is left as a warning.
+  Regression tests:
+  `tests/test_rules.py::TestVisitOccurrenceInnerJoinValidation::test_omop_043_person_id_join_to_visit_does_not_fire`,
+  `…test_omop_043_mixed_keys_still_fires`,
+  `…test_omop_043_void_in_non_equality_predicate_does_not_fire`,
+  `…test_omop_043_void_comparison_predicate_does_not_fire`,
+  and `…test_omop_043_void_equality_to_literal_still_fires`.
+
+- **`anti_patterns.limit_without_order_by` no longer warns on scalar
+  aggregations.** A `SELECT COUNT(DISTINCT person_id) … LIMIT 1000` —
+  the textbook Atlas/OHDSI patient-count shape — returns exactly one
+  row, so `LIMIT N` is a no-op and the missing-`ORDER BY` warning is a
+  false positive (4/5 FPs of this shape in audit sampling). The rule
+  now skips a `Select` when (a) it has no `GROUP BY` / `HAVING`, (b) no
+  projection contains a window function (`f(...) OVER (...)`; windowed
+  aggregates are per-row, not row-collapsing), (c) at least one
+  projection contains a non-windowed aggregate, and (d) no projection
+  has a bare (non-aggregated) `Column` reference. Star projections,
+  bare-column projections, window functions, and `GROUP BY`-driven
+  multi-row results continue to warn as before. Regression tests:
+  `tests/test_rules.py::TestLimitWithoutOrderBy` (10 cases including
+  three windowed-aggregate shapes — `SUM(x) OVER ()`,
+  `ROW_NUMBER() OVER (ORDER BY …)`, and
+  `COUNT(*) OVER (PARTITION BY …)` — added after code review caught
+  an earlier draft that treated the inner `AggFunc` inside an
+  `exp.Window` as scalar-agg evidence).
+
+- **`joins.join_path_validation` now recognises IN-subquery CTE
+  bridges.** The pre-existing CTE-bridge check only inspected `JOIN ON`
+  equalities, missing the canonical concept-set shape
+  `WHERE x_concept_id IN (SELECT concept_id FROM <vocab_cte>)` — every
+  Atlas-style cohort builder that materialises drug/condition concept
+  sets in a CTE and feeds them into `drug_exposure`/`condition_occurrence`
+  via `IN`-subquery was hit with a spurious _"Query uses 'concept' table
+  but it may not be properly joined…"_ warning (5/5 FPs of this shape
+  in audit sampling). A new private helper
+  `_has_in_subquery_bridge_to_vocab_cte` walks `exp.In` nodes whose LHS
+  is a `_concept_id` column and whose RHS subquery (`In.args["query"]`)
+  selects from a vocab CTE, treating that as a valid indirect bridge.
+  Additive — JOIN-on, comma-join WHERE, and direct-JOIN paths all
+  remain. Regression test:
+  `tests/test_rules.py::TestJoinPathValidation::test_in_subquery_bridge_to_vocab_cte_does_not_fire`.
+
+- **`joins.left_join_then_where_on_right_table` is now scope-aware.**
+  The rule previously built a tree-wide pool of "right tables that appear
+  on the right of any `LEFT JOIN`" and matched it against every `WHERE`
+  in the tree, so a `LEFT JOIN omop.concept_relationship cr` declared in
+  one CTE got cross-linked with a `WHERE cr.relationship_id = 'Maps to'`
+  living in a *different* sibling CTE that re-used the alias `cr` for an
+  ordinary `INNER JOIN` — producing spurious _"LEFT JOIN followed by
+  WHERE filtering right table column(s): concept_relationship.relationship_id"_
+  reports on standard Maps-to vocabulary plumbing. The check is now done
+  per `Select` scope: each scope's LEFT-JOIN right-tables are matched
+  only against that scope's own `WHERE`, with column resolution going
+  through a scope-local alias map (mirroring the `comprehensive_schema_validation`
+  pattern from the previous fix). True positives within a single scope
+  still fire as before. Regression tests:
+  `tests/test_rules.py::TestLeftJoinThenWhereOnRightTable::test_omop_149_alias_collision_across_ctes_does_not_false_positive`
+  and `…test_omop_149_left_join_in_inner_cte_still_fires_in_own_scope`.
+
+- **OMOP-table-targeting rules no longer false-positive on user CTEs that
+  shadow OMOP table names.** `core.helpers.has_table_reference` is the
+  gating check used by ~50 rules that key off specific OMOP tables
+  (`cohort`, `person`, `concept`, the join family, etc.) — and it
+  previously treated `WITH cohort AS (...) ... FROM cohort c` as a
+  reference to the OMOP `cohort` table, so a CTE named `cohort` with
+  its own `person_id` column would trip
+  `joins.cohort_clinical_join_validation` (and the like) with messages
+  like _"Invalid FK join between cohort and condition_occurrence:
+  cohort.person_id = …"_ even though the SQL was perfectly valid. The
+  helper is now CTE-aware *per Table node*: for each unqualified
+  reference, the helper walks the reference's ancestors and checks
+  every WITH clause hung off them; if a CTE with the matching name
+  is visible from that scope (and the reference isn't inside the CTE's
+  own body — non-recursive self-reference rule), the reference is
+  treated as the CTE. The walk checks *every* ancestor's WITH slot,
+  not just `Select` nodes — sqlglot attaches the WITH of
+  `WITH x AS (…) SELECT … UNION SELECT … FROM x` to the `Union` node
+  and that of `WITH x AS (…) INSERT INTO t SELECT … FROM x` to the
+  `Insert`, so a Select-only walk (an earlier draft, caught in code
+  review) missed both shapes and treated their CTE references as real
+  OMOP tables. Schema-qualified references (`mydb.cohort`)
+  always bypass shadowing per standard SQL scoping. The per-node
+  walk avoids over-approximating CTE visibility: a CTE named `cohort`
+  defined inside a nested subquery does NOT shadow an outer
+  `FROM cohort` (an earlier draft of this fix used a tree-global
+  `collect_cte_names` intersection and would have silently suppressed
+  in that case — caught in code review). A new `collect_cte_names(tree)`
+  helper is also exported for callers that *do* want the tree-global
+  set (e.g. `anti_patterns.cte_shadows_omop_table`, which flags any
+  shadow no matter how nested) — its docstring is explicit about the
+  over-approximation. `extract_aliases` is intentionally unchanged —
+  `joins.join_path_validation` and other rules with their own
+  CTE-bridge logic depend on its current bare-name semantics.
+  Regression tests added in `tests/test_helpers_cte.py` (covering
+  outer-WITH shadow, schema-qualified bypass, nested-WITH non-shadow,
+  self-reference resolution, and the WITH-on-UNION / WITH-on-INSERT
+  attachment shapes) and
+  `tests/test_rules.py::TestCohortClinicalJoinValidation`.
+
+- **`deploy/.env.example` documents `FASTSSV_API_BEHIND_PROXY`.** The
+  reverse-proxy toggle added with HTTPS support is wired through
+  `deploy/docker-compose.yml` (compose-level default `true`) and read by
+  `Settings.behind_proxy` in `src/fastssv/api/config.py` (in-code default
+  `false`), but it was missing from `deploy/.env.example`. Operators
+  copying the example file as a config reference now see the variable,
+  what it does (trust `X-Forwarded-*` from an upstream TLS terminator so
+  generated URLs reflect the external scheme/host), and the
+  compose-vs-code default split. No behaviour change — purely a
+  documentation gap fix.
+
+## [0.3.0] - 2026-05-06
+
+### Changed
 
 - **`parse_sql` is now `lru_cache`-d on `(sql, dialect)`.** A single
   `validate_sql_structured` call dispatches to ~150 registered rules,
@@ -650,169 +887,6 @@ between minor versions.
   example that referenced a nonexistent `validate_anti_patterns` symbol.
 
 ### Fixed
-
-- **`data_quality.schema_validation` is now scope-aware for column
-  resolution.** `comprehensive_schema_validation` previously resolved
-  every `Column` ref through the global `extract_aliases` dict, which
-  is a flat name -> table map. When the same alias was used across
-  CTEs (for example `omop.concept c` inside one CTE and `cond_occ c` in
-  the outer SELECT), the dict collapsed to last-write-wins and the
-  rule misattributed columns — yielding spurious errors like
-  _"Column 'person_id' does not exist in table 'concept'"_ on
-  perfectly valid SQL. The rule now walks each `Column`'s enclosing
-  `Select` scope to build a scope-local alias map (correlated outer
-  scopes are still visible; inner scopes shadow). On a representative
-  11k-query benchmark this drops `schema_validation` errors from 341
-  to 131. The new helpers (`_local_aliases`, `_resolve_column_table`)
-  are private to the rule, since the global `extract_aliases` is still
-  the right contract for rules that work on join-condition pairs.
-  Regression test:
-  `tests/test_rules.py::TestSchemaValidation::test_alias_collision_across_ctes_does_not_false_positive`.
-
-- **`data_quality.schema_validation` no longer flags `DATEDIFF` unit
-  keywords as missing columns.** sqlglot parses `DATEDIFF(day, x, y)`
-  with `day` as a `Column` node (rather than a literal/Var). Without
-  filtering, the schema check produced
-  _"Column 'day' does not exist in table 'condition_occurrence'"_ for
-  every query that used `DATEDIFF`/`DATEADD`/`DATETRUNC`/`EXTRACT` etc.
-  The rule now skips unqualified `Column` nodes whose name is a
-  recognised time-unit keyword (`day`, `month`, `year`, `hour`,
-  `minute`, …) and whose parent is one of the date-arithmetic
-  function types. Regression test:
-  `tests/test_rules.py::TestSchemaValidation::test_datediff_unit_keyword_not_treated_as_column`.
-
-- **`joins.visit_occurrence_inner_join_validation` no longer warns on
-  non-VOID join keys.** OMOP_043's premise is that an `INNER JOIN
-  visit_occurrence ON event.visit_occurrence_id = vo.visit_occurrence_id`
-  silently drops the 20–60% of clinical events with NULL
-  `visit_occurrence_id`. That premise only applies when the JOIN key is
-  actually `visit_occurrence_id` — but `_is_vo_join` previously fired
-  on any INNER JOIN that *involved* `visit_occurrence`, regardless of
-  key. The canonical cohort-builder shape
-  `cohort c JOIN visit_occurrence vo ON c.person_id = vo.person_id`
-  (where `person_id` is NOT NULL on both sides and no rows can be
-  dropped due to NULL visit linkage) was therefore flagged as a
-  potentially-data-losing INNER JOIN. The rule now gates on a new
-  `_join_on_uses_visit_occurrence_id` check that walks `exp.EQ` nodes
-  in the ON clause and only returns True when `visit_occurrence_id`
-  appears on at least one side of an *equality* (not just anywhere in
-  the ON clause — an earlier draft walked every `exp.Column` and
-  reintroduced the same false positive class via non-equality
-  predicates like `vo.visit_occurrence_id IS NOT NULL` or
-  `vo.visit_occurrence_id > 0`; caught in code review). Mixed-key joins
-  (`ON co.visit_occurrence_id = vo.visit_occurrence_id AND co.person_id = vo.person_id`)
-  still fire because VOID linkage is in play. The implicit/comma-join
-  branch is unchanged — comma-joining `visit_occurrence` to an event
-  table almost always means visit linkage and is left as a warning.
-  Regression tests:
-  `tests/test_rules.py::TestVisitOccurrenceInnerJoinValidation::test_omop_043_person_id_join_to_visit_does_not_fire`,
-  `…test_omop_043_mixed_keys_still_fires`,
-  `…test_omop_043_void_in_non_equality_predicate_does_not_fire`,
-  `…test_omop_043_void_comparison_predicate_does_not_fire`,
-  and `…test_omop_043_void_equality_to_literal_still_fires`.
-
-- **`anti_patterns.limit_without_order_by` no longer warns on scalar
-  aggregations.** A `SELECT COUNT(DISTINCT person_id) … LIMIT 1000` —
-  the textbook Atlas/OHDSI patient-count shape — returns exactly one
-  row, so `LIMIT N` is a no-op and the missing-`ORDER BY` warning is a
-  false positive (4/5 FPs of this shape in audit sampling). The rule
-  now skips a `Select` when (a) it has no `GROUP BY` / `HAVING`, (b) no
-  projection contains a window function (`f(...) OVER (...)`; windowed
-  aggregates are per-row, not row-collapsing), (c) at least one
-  projection contains a non-windowed aggregate, and (d) no projection
-  has a bare (non-aggregated) `Column` reference. Star projections,
-  bare-column projections, window functions, and `GROUP BY`-driven
-  multi-row results continue to warn as before. Regression tests:
-  `tests/test_rules.py::TestLimitWithoutOrderBy` (10 cases including
-  three windowed-aggregate shapes — `SUM(x) OVER ()`,
-  `ROW_NUMBER() OVER (ORDER BY …)`, and
-  `COUNT(*) OVER (PARTITION BY …)` — added after code review caught
-  an earlier draft that treated the inner `AggFunc` inside an
-  `exp.Window` as scalar-agg evidence).
-
-- **`joins.join_path_validation` now recognises IN-subquery CTE
-  bridges.** The pre-existing CTE-bridge check only inspected `JOIN ON`
-  equalities, missing the canonical concept-set shape
-  `WHERE x_concept_id IN (SELECT concept_id FROM <vocab_cte>)` — every
-  Atlas-style cohort builder that materialises drug/condition concept
-  sets in a CTE and feeds them into `drug_exposure`/`condition_occurrence`
-  via `IN`-subquery was hit with a spurious _"Query uses 'concept' table
-  but it may not be properly joined…"_ warning (5/5 FPs of this shape
-  in audit sampling). A new private helper
-  `_has_in_subquery_bridge_to_vocab_cte` walks `exp.In` nodes whose LHS
-  is a `_concept_id` column and whose RHS subquery (`In.args["query"]`)
-  selects from a vocab CTE, treating that as a valid indirect bridge.
-  Additive — JOIN-on, comma-join WHERE, and direct-JOIN paths all
-  remain. Regression test:
-  `tests/test_rules.py::TestJoinPathValidation::test_in_subquery_bridge_to_vocab_cte_does_not_fire`.
-
-- **`joins.left_join_then_where_on_right_table` is now scope-aware.**
-  The rule previously built a tree-wide pool of "right tables that appear
-  on the right of any `LEFT JOIN`" and matched it against every `WHERE`
-  in the tree, so a `LEFT JOIN omop.concept_relationship cr` declared in
-  one CTE got cross-linked with a `WHERE cr.relationship_id = 'Maps to'`
-  living in a *different* sibling CTE that re-used the alias `cr` for an
-  ordinary `INNER JOIN` — producing spurious _"LEFT JOIN followed by
-  WHERE filtering right table column(s): concept_relationship.relationship_id"_
-  reports on standard Maps-to vocabulary plumbing. The check is now done
-  per `Select` scope: each scope's LEFT-JOIN right-tables are matched
-  only against that scope's own `WHERE`, with column resolution going
-  through a scope-local alias map (mirroring the `comprehensive_schema_validation`
-  pattern from the previous fix). True positives within a single scope
-  still fire as before. Regression tests:
-  `tests/test_rules.py::TestLeftJoinThenWhereOnRightTable::test_omop_149_alias_collision_across_ctes_does_not_false_positive`
-  and `…test_omop_149_left_join_in_inner_cte_still_fires_in_own_scope`.
-
-- **OMOP-table-targeting rules no longer false-positive on user CTEs that
-  shadow OMOP table names.** `core.helpers.has_table_reference` is the
-  gating check used by ~50 rules that key off specific OMOP tables
-  (`cohort`, `person`, `concept`, the join family, etc.) — and it
-  previously treated `WITH cohort AS (...) ... FROM cohort c` as a
-  reference to the OMOP `cohort` table, so a CTE named `cohort` with
-  its own `person_id` column would trip
-  `joins.cohort_clinical_join_validation` (and the like) with messages
-  like _"Invalid FK join between cohort and condition_occurrence:
-  cohort.person_id = …"_ even though the SQL was perfectly valid. The
-  helper is now CTE-aware *per Table node*: for each unqualified
-  reference, the helper walks the reference's ancestors and checks
-  every WITH clause hung off them; if a CTE with the matching name
-  is visible from that scope (and the reference isn't inside the CTE's
-  own body — non-recursive self-reference rule), the reference is
-  treated as the CTE. The walk checks *every* ancestor's WITH slot,
-  not just `Select` nodes — sqlglot attaches the WITH of
-  `WITH x AS (…) SELECT … UNION SELECT … FROM x` to the `Union` node
-  and that of `WITH x AS (…) INSERT INTO t SELECT … FROM x` to the
-  `Insert`, so a Select-only walk (an earlier draft, caught in code
-  review) missed both shapes and treated their CTE references as real
-  OMOP tables. Schema-qualified references (`mydb.cohort`)
-  always bypass shadowing per standard SQL scoping. The per-node
-  walk avoids over-approximating CTE visibility: a CTE named `cohort`
-  defined inside a nested subquery does NOT shadow an outer
-  `FROM cohort` (an earlier draft of this fix used a tree-global
-  `collect_cte_names` intersection and would have silently suppressed
-  in that case — caught in code review). A new `collect_cte_names(tree)`
-  helper is also exported for callers that *do* want the tree-global
-  set (e.g. `anti_patterns.cte_shadows_omop_table`, which flags any
-  shadow no matter how nested) — its docstring is explicit about the
-  over-approximation. `extract_aliases` is intentionally unchanged —
-  `joins.join_path_validation` and other rules with their own
-  CTE-bridge logic depend on its current bare-name semantics.
-  Regression tests added in `tests/test_helpers_cte.py` (covering
-  outer-WITH shadow, schema-qualified bypass, nested-WITH non-shadow,
-  self-reference resolution, and the WITH-on-UNION / WITH-on-INSERT
-  attachment shapes) and
-  `tests/test_rules.py::TestCohortClinicalJoinValidation`.
-
-- **`deploy/.env.example` documents `FASTSSV_API_BEHIND_PROXY`.** The
-  reverse-proxy toggle added with HTTPS support is wired through
-  `deploy/docker-compose.yml` (compose-level default `true`) and read by
-  `Settings.behind_proxy` in `src/fastssv/api/config.py` (in-code default
-  `false`), but it was missing from `deploy/.env.example`. Operators
-  copying the example file as a config reference now see the variable,
-  what it does (trust `X-Forwarded-*` from an upstream TLS terminator so
-  generated URLs reflect the external scheme/host), and the
-  compose-vs-code default split. No behaviour change — purely a
-  documentation gap fix.
 
 - **Documentation correctness pass.** Multiple doc pages had drifted from the
   registry and the API surface; fixes applied across `docs/`:

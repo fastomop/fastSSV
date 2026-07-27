@@ -122,14 +122,14 @@ The full step-by-step walkthrough lives in [Plugin system](plugin_architecture.m
 
 ### Category Summary
 
-- `anti_patterns`: 20 rules
+- `anti_patterns`: 21 rules
 - `concept_standardization`: 18 rules
 - `data_quality`: 22 rules
 - `domain_specific`: 48 rules
 - `joins`: 36 rules
 - `temporal`: 10 rules
 
-**Total: 154 rules**
+**Total: 155 rules**
 
 > The category `schema` also exists as a Python package but contains the
 > single fundamental-correctness rule `data_quality.schema_validation`;

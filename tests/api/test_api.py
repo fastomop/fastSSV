@@ -179,6 +179,64 @@ def test_security_headers_present(client: TestClient):
     assert resp.headers["X-Frame-Options"] == "DENY"
     assert "Referrer-Policy" in resp.headers
     assert "Strict-Transport-Security" in resp.headers
+    csp = resp.headers["Content-Security-Policy"]
+    assert "default-src 'self'" in csp
+    assert "frame-ancestors 'none'" in csp
+
+
+def test_validation_capacity_returns_503(client: TestClient):
+    """With the per-worker semaphore saturated, /v1/validate fails fast with
+    503 instead of queueing onto (potentially pinned) worker threads."""
+    import asyncio
+
+    sem = client.app.state.validation_semaphore
+    held = 0
+    while not sem.locked():
+        asyncio.run(sem.acquire())
+        held += 1
+    try:
+        resp = client.post(
+            "/v1/validate",
+            json={"sql": "SELECT person_id FROM person;", "dialect": "postgres"},
+        )
+        assert resp.status_code == 503
+        assert resp.json()["error"] == "service_unavailable"
+        assert resp.headers["Retry-After"] == "1"
+    finally:
+        for _ in range(held):
+            sem.release()
+
+    # Released → requests flow again.
+    resp = client.post(
+        "/v1/validate",
+        json={"sql": "SELECT person_id FROM person;", "dialect": "postgres"},
+    )
+    assert resp.status_code == 200
+
+
+def test_health_exempt_from_rate_limit():
+    """LB/kubelet probes must never be throttled into 429s by client traffic
+    from the same source IP."""
+    settings = Settings(
+        max_sql_bytes=1024,
+        rate_limit="2/minute",
+        cors_origins=[],
+        log_level="WARNING",
+        mcp_enabled=False,
+    )
+    limited = TestClient(create_app(settings))
+    for _ in range(6):
+        assert limited.get("/v1/health").status_code == 200
+
+    # The default limit does apply to everything else.
+    codes = [
+        limited.post(
+            "/v1/validate",
+            json={"sql": "SELECT person_id FROM person;", "dialect": "postgres"},
+        ).status_code
+        for _ in range(3)
+    ]
+    assert 429 in codes
 
 
 def test_request_id_echoed(client: TestClient):

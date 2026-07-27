@@ -211,14 +211,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--categories",
         nargs="*",
         choices=[
-            "analytics",
             "anti_patterns",
             "concept_standardization",
             "data_quality",
             "domain_specific",
             "joins",
-            "performance",
-            "schema",
             "temporal",
         ],
         help="Rule categories to run (default: all).",
@@ -261,13 +258,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     logger.debug(f"FastSSV CLI started with args: {vars(args)}")
 
-    # Read SQL input
+    # Read SQL input. OSError covers the missing/unreadable-file family;
+    # surface it as a one-line message + exit code 2 (usage/input error)
+    # rather than a raw traceback.
     try:
         sql = _clean_llm_output(_read_sql(args.sql_file))
-        logger.info(f"Read SQL input: {len(sql)} characters from {args.sql_file or 'stdin'}")
-    except Exception as e:
+    except (OSError, UnicodeDecodeError) as e:
         logger.error(f"Failed to read SQL input: {e}")
-        raise
+        print(f"error: cannot read SQL from {args.sql_file or 'stdin'}: {e}", file=sys.stderr)
+        return 2
+    logger.info(f"Read SQL input: {len(sql)} characters from {args.sql_file or 'stdin'}")
 
     # Split into queries
     queries = _split_queries(sql)

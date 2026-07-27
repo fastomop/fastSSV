@@ -125,8 +125,7 @@ def validate_sql(
 
     # Run rules and collect violations
     for rule_cls in rule_classes:
-        rule = rule_cls()
-        violations = rule.validate(sql, dialect)
+        violations = _run_rule(rule_cls, sql, dialect)
         results["violations"].extend(violations)
 
         # Populate grouped fields
@@ -146,6 +145,43 @@ def validate_sql(
 PARSE_ERROR_RULE_ID = "parse.syntax_error"
 NOT_SQL_RULE_ID = "parse.not_sql_input"
 TEMPLATE_RULE_ID = "meta.unrendered_sqlrender_template"
+RULE_EXECUTION_ERROR_RULE_ID = "meta.rule_execution_error"
+
+
+def _make_rule_error_violation(rule_id: str, exc: Exception) -> RuleViolation:
+    """Build the WARNING emitted when a rule raises instead of returning.
+
+    One misbehaving rule must not abort the whole batch (library/CLI) or
+    turn into a 500 (API): the registry runs 150+ rules, any of which can
+    hit an AST shape its author didn't anticipate. WARNING rather than
+    ERROR because the *query* isn't known to be wrong — the validator is —
+    so a clean query shouldn't flip to INVALID over an internal bug.
+    """
+    return RuleViolation(
+        rule_id=RULE_EXECUTION_ERROR_RULE_ID,
+        severity=Severity.WARNING,
+        message=(
+            f"Internal error while running rule '{rule_id}': "
+            f"{type(exc).__name__}: {exc}. The rule was skipped; all other "
+            "rules still ran."
+        ),
+        suggested_fix=(
+            "FREEFORM: this is a bug in fastssv, not in your SQL. Report it "
+            f"(with the SQL and rule id '{rule_id}') at "
+            "https://github.com/fastomop/fastSSV/issues."
+        ),
+        details={"failed_rule_id": rule_id, "error": f"{type(exc).__name__}: {exc}", "category": "internal"},
+    )
+
+
+def _run_rule(rule_cls, sql: str, dialect: str) -> List[RuleViolation]:
+    """Instantiate and run one rule, isolating any exception it raises."""
+    try:
+        return rule_cls().validate(sql, dialect)
+    except Exception as exc:
+        rule_id = getattr(rule_cls, "rule_id", rule_cls.__name__)
+        _logger.exception(f"Rule {rule_id} raised during validation; skipping it")
+        return [_make_rule_error_violation(rule_id, exc)]
 
 
 def _make_template_skipped_violation() -> RuleViolation:
@@ -288,17 +324,15 @@ def validate_sql_structured(
     # Run rules and collect violations
     violations = []
     for rule_cls in rule_classes:
-        rule = rule_cls()
-
         # Time rule execution if performance logging enabled
         start_time = time.perf_counter()
-        rule_violations = rule.validate(sql, dialect)
+        rule_violations = _run_rule(rule_cls, sql, dialect)
         duration_ms = (time.perf_counter() - start_time) * 1000
 
         violations.extend(rule_violations)
 
         # Log rule execution
-        log_rule_execution(_logger, rule.rule_id, len(rule_violations), duration_ms)
+        log_rule_execution(_logger, rule_cls.rule_id, len(rule_violations), duration_ms)
 
     _logger.info(f"Executed {len(rule_classes)} rules, found {len(violations)} violations before deduplication")
 
@@ -324,8 +358,7 @@ def _validate_category_strings(sql: str, category: str, dialect: str = "postgres
 
     results: List[str] = []
     for rule_cls in get_rules_by_category(category):
-        rule = rule_cls()
-        for v in rule.validate(sql, dialect):
+        for v in _run_rule(rule_cls, sql, dialect):
             prefix = "Warning: " if v.severity == Severity.WARNING else ""
             results.append(f"{prefix}{v.message}")
     return results
@@ -422,6 +455,7 @@ __all__ = [
     "validate_sql_structured",
     "PARSE_ERROR_RULE_ID",
     "NOT_SQL_RULE_ID",
+    "RULE_EXECUTION_ERROR_RULE_ID",
     # Core classes
     "Rule",
     "RuleViolation",

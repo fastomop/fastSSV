@@ -28,6 +28,17 @@ from fastssv.core.validation_context import with_local_tables, with_strict_mode
 logger = logging.getLogger("fastssv.api")
 
 
+class _NullAsyncContext:
+    async def __aenter__(self):
+        return None
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+
+_NULL_CONTEXT = _NullAsyncContext()
+
+
 def _sql_hash(sql: str) -> str:
     return hashlib.sha256(sql.encode("utf-8", errors="replace")).hexdigest()[:16]
 
@@ -46,11 +57,16 @@ async def run_validation(
     settings: Settings,
     *,
     client: str | None = None,
+    request_id: str | None = None,
+    semaphore: asyncio.Semaphore | None = None,
 ) -> ValidationResponse:
     """Validate a SQL submission and return the structured response.
 
     Raises HTTPException(413) if the submission exceeds max_sql_bytes,
-    HTTPException(408) if validation exceeds parse_timeout_seconds.
+    HTTPException(408) if validation exceeds parse_timeout_seconds, and
+    HTTPException(503) when ``semaphore`` is saturated — a timed-out
+    validation keeps running on its worker thread (CPU-bound sqlglot work
+    can't be cancelled), so refusing new work beats pinning every thread.
     """
     sql_bytes = len(sql.encode("utf-8"))
     if sql_bytes > settings.max_sql_bytes:
@@ -71,13 +87,25 @@ async def run_validation(
     local_tables = collect_locally_defined_tables(sql, dialect)
     local_unqualified = collect_locally_defined_unqualified_tables(sql, dialect)
 
+    if semaphore is not None and semaphore.locked():
+        logger.warning(
+            "validation_capacity_exceeded",
+            extra={"sql_hash": _sql_hash(sql), "client": client, "request_id": request_id},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Server is at validation capacity; retry shortly.",
+            headers={"Retry-After": "1"},
+        )
+
     started = time.perf_counter()
     try:
-        with with_strict_mode(strict), with_local_tables(local_tables, local_unqualified):
-            per_query = await asyncio.wait_for(
-                asyncio.to_thread(_validate_each, statements, dialect),
-                timeout=settings.parse_timeout_seconds,
-            )
+        async with semaphore if semaphore is not None else _NULL_CONTEXT:
+            with with_strict_mode(strict), with_local_tables(local_tables, local_unqualified):
+                per_query = await asyncio.wait_for(
+                    asyncio.to_thread(_validate_each, statements, dialect),
+                    timeout=settings.parse_timeout_seconds,
+                )
     except asyncio.TimeoutError as exc:
         logger.warning(
             "validation_timeout",
@@ -87,6 +115,7 @@ async def run_validation(
                 "strict": strict,
                 "query_count": len(statements),
                 "client": client,
+                "request_id": request_id,
             },
         )
         raise HTTPException(
@@ -127,6 +156,7 @@ async def run_validation(
             "warnings": len(all_warnings),
             "duration_ms": round(duration_ms, 2),
             "client": client,
+            "request_id": request_id,
         },
     )
 
