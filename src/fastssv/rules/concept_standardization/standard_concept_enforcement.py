@@ -454,7 +454,12 @@ class StandardConceptEnforcementRule(Rule):
             # Enforcement signals (shared across both branches).
             has_standard_enforcement = _enforces_standard_concept(tree)
             has_maps_to = _uses_maps_to_relationship(tree)
-            has_specific_filter = _has_specific_concept_id_filter(tree, aliases, all_concept_fields)
+            # Evaluated separately per field class: a literal filter on a
+            # *standard* concept column must not suppress the source-concept
+            # warning (and vice versa) — the "user already chose specific
+            # concepts" intent only extends to the field class it filters.
+            has_specific_source_filter = _has_specific_concept_id_filter(tree, aliases, source_fields)
+            has_specific_standard_filter = _has_specific_concept_id_filter(tree, aliases, standard_fields)
             has_concept_ancestor_filter = _filters_via_concept_ancestor(tree, aliases, standard_fields)
             has_concept_ancestor_join = _has_clinical_join_to_concept_ancestor(tree, aliases, standard_fields)
             has_concept_ancestor_chain = _has_chained_join_to_concept_ancestor_via_concept(
@@ -469,7 +474,7 @@ class StandardConceptEnforcementRule(Rule):
             # Analytical use without (a) ``Maps to`` mapping, (b) a specific
             # literal filter, or (c) a concept_ancestor pattern feeding into
             # it, mixes vocabulary layers silently.
-            if source_refs and not (has_maps_to or has_specific_filter or any_concept_ancestor):
+            if source_refs and not (has_maps_to or has_specific_source_filter or any_concept_ancestor):
                 first_t, first_c = source_refs[0]
                 violations.append(
                     self.create_violation(
@@ -507,7 +512,7 @@ class StandardConceptEnforcementRule(Rule):
 
             if strict:
                 fires_standard = not (
-                    has_standard_enforcement or has_maps_to or has_specific_filter or any_concept_ancestor
+                    has_standard_enforcement or has_maps_to or has_specific_standard_filter or any_concept_ancestor
                 )
             else:
                 fires_standard = vocab_in_scope and not (has_standard_enforcement or any_concept_ancestor)

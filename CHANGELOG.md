@@ -418,6 +418,30 @@ between minor versions.
 
 ### Fixed
 
+- **`concept_standardization.standard_concept_enforcement`: the
+  specific-literal-filter suppression is now evaluated per field class.**
+  Previously one flag was computed over all concept fields (standard ∪
+  source), so a literal filter on a *standard* column
+  (`condition_concept_id IN (…)`) silenced the source-concept warning
+  about an unrelated, unmapped `*_source_concept_id` reference — and,
+  in strict mode, a literal filter on a source column suppressed the
+  standard-concept check. The suppression now uses two flags: literal
+  filters on source fields gate the source-concept branch, literal
+  filters on standard fields gate the strict standard-concept branch.
+  Queries that filter the same field class they reference are unaffected.
+
+- **`data_quality.schema_validation` no longer flags `INSERT INTO`
+  targets as unknown OMOP tables.** The DDL/maintenance-target skip
+  (CREATE/DROP/ALTER/ANALYZE/TRUNCATE) didn't cover `exp.Insert`, so
+  `INSERT INTO results.achilles_results (…) SELECT …` — the standard
+  OHDSI Achilles write pattern against a results/scratch namespace —
+  produced a false "table does not exist in OMOP CDM" error for the
+  write target. All three sqlglot target shapes are now skipped
+  (qualified, unqualified, and column-list targets, which parse as
+  `Insert(this=Schema(this=Table(…)))` and need one `Schema` unwrap
+  before the parent check). Tables *read* in the INSERT's SELECT body
+  are still validated.
+
 - **`dialect="auto"` (the API/MCP default) no longer silently disables
   cross-statement local-table scoping.** `run_validation` passed the raw
   `"auto"` sentinel to `collect_locally_defined_tables` /

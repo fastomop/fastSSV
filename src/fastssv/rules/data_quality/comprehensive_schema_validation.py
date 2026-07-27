@@ -294,14 +294,22 @@ class ComprehensiveSchemaValidationRule(Rule):
                 if not table_name:
                     continue
 
-                # Skip DDL / maintenance targets — the table is being
-                # defined, dropped, altered, analyzed, or truncated here,
-                # not referenced. Patterns this covers:
+                # Skip DDL / maintenance / write targets — the table is being
+                # defined, dropped, altered, analyzed, truncated, or written
+                # into here, not referenced. Patterns this covers:
                 #   CREATE TABLE scratch.tmpach_0 AS SELECT … FROM cdm.person
                 #   DROP TABLE scratch.tempResults_104
                 #   ANALYZE tempResults_104
-                # OHDSI Achilles emits all three against a scratch namespace.
-                if isinstance(table.parent, _DDL_TARGET_PARENTS):
+                #   INSERT INTO results.achilles_results (…) SELECT …
+                # OHDSI Achilles emits all four against scratch/results
+                # namespaces that are never part of the CDM catalog. A
+                # target with a column list parses as
+                # Insert(this=Schema(this=Table(…))), so unwrap one Schema
+                # level before checking the parent.
+                parent = table.parent
+                if isinstance(parent, exp.Schema):
+                    parent = parent.parent
+                if isinstance(parent, (exp.Insert, *_DDL_TARGET_PARENTS)):
                     continue
 
                 # Skip schema-qualified tables (@vocab.concept -> concept)

@@ -70,6 +70,35 @@ class TestStandardConceptMapping:
         errors = validate_standard_concept_mapping(sql)
         assert errors == []
 
+    def test_standard_filter_does_not_suppress_source_warning(self) -> None:
+        """A literal filter on a *standard* concept column must not silence
+        the source-concept warning — 'specific concepts chosen' intent only
+        extends to the field class the filter targets."""
+        from fastssv.core.registry import get_rule
+
+        sql = """
+        SELECT co.condition_source_concept_id
+        FROM condition_occurrence co
+        WHERE co.condition_concept_id IN (201826)
+        """
+        rule = get_rule("concept_standardization.standard_concept_enforcement")()
+        violations = rule.validate(sql, "postgres")
+        assert any(v.details.get("issue") == "source_concept_not_mapped" for v in violations)
+
+    def test_source_filter_still_suppresses_source_warning(self) -> None:
+        """A literal filter on the source field itself signals explicit
+        source-value intent and keeps suppressing the warning."""
+        from fastssv.core.registry import get_rule
+
+        sql = """
+        SELECT co.condition_source_concept_id
+        FROM condition_occurrence co
+        WHERE co.condition_source_concept_id IN (44836914)
+        """
+        rule = get_rule("concept_standardization.standard_concept_enforcement")()
+        violations = rule.validate(sql, "postgres")
+        assert not any(v.details.get("issue") == "source_concept_not_mapped" for v in violations)
+
     def test_query_with_maps_to_relationship(self) -> None:
         """Query with 'Maps to' relationship should pass."""
         sql = """
@@ -3664,6 +3693,25 @@ class TestSchemaValidation:
         from fastssv.core.registry import get_rule
         rule = get_rule("data_quality.schema_validation")()
         return rule.validate(sql)
+
+    def test_insert_target_not_flagged(self) -> None:
+        """INSERT targets are write targets, not references — Achilles
+        writes into results/scratch tables that are never CDM tables.
+        Covers all three sqlglot shapes: qualified, with a column list
+        (Insert(this=Schema(this=Table))), and unqualified."""
+        for sql in (
+            "INSERT INTO scratch.tempresults SELECT person_id FROM person",
+            "INSERT INTO results.achilles_results (n) SELECT person_id FROM person",
+            "INSERT INTO tempresults SELECT person_id FROM person",
+        ):
+            assert self._run_rule(sql) == [], sql
+
+    def test_insert_select_body_still_validated(self) -> None:
+        """Skipping the INSERT *target* must not skip tables read in the
+        SELECT body."""
+        violations = self._run_rule("INSERT INTO tempresults SELECT x FROM bogus_table")
+        assert len(violations) == 1
+        assert "bogus_table" in violations[0].message
 
     # OMOP_023: death_id column doesn't exist in death table
     def test_omop_023_death_id_column_does_not_exist(self) -> None:
